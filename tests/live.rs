@@ -11,10 +11,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
 
 use vss_snapshot::{
     list_writers, ComponentId, Consistency, Error, Guid, SnapshotOptions, SnapshotSet,
@@ -159,12 +161,30 @@ fn reads_a_file_that_is_locked_on_the_live_volume() {
 fn refs_volume() -> String {
     let volume = std::env::var("VSS_SNAPSHOT_TEST_REFS_VOLUME")
         .expect("the workflow should set VSS_SNAPSHOT_TEST_REFS_VOLUME");
-    let output = Command::new("fsutil")
-        .args(["fsinfo", "volumeinfo", &format!(r"{volume}\")])
-        .output()
-        .expect("fsutil should be on the PATH");
-    let info = String::from_utf8_lossy(&output.stdout);
-    assert!(info.contains("ReFS"), "{volume} isn't ReFS:\n{info}");
+    let root: Vec<u16> = format!("{volume}\\\0").encode_utf16().collect();
+    let mut name = [0u16; 32];
+    // SAFETY: `root` is nul-terminated and outlives the call, which writes no more than
+    // `name.len()` units.
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(root.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut name),
+        )
+    }
+    .unwrap();
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    assert_eq!(
+        String::from_utf16_lossy(&name[..length]),
+        "ReFS",
+        "{volume}"
+    );
     volume
 }
 
