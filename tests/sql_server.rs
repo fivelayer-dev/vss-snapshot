@@ -342,6 +342,10 @@ fn a_component_not_in_the_document_is_not_found() {
 const ORPHAN_LIMIT: Duration = Duration::from_secs(12 * 60);
 /// How long to watch a database after a killed restore, in case its writer notices.
 const RESTORE_WATCH: Duration = Duration::from_secs(120);
+/// How long to wait for writers to freeze, or to resume after a kill.
+const FREEZE_LIMIT: Duration = Duration::from_secs(180);
+/// How many times to try landing a kill while writers are frozen.
+const KILL_ATTEMPTS: u32 = 5;
 
 fn crash(test: &str) -> Option<Sql> {
     let sql = sql(test)?;
@@ -353,8 +357,8 @@ fn crash(test: &str) -> Option<Sql> {
 }
 
 /// Not a real test. The crash tests run this binary again with
-/// `VSS_SNAPSHOT_TEST_CRASH_CHILD` set, to get a process they can kill while it holds a
-/// snapshot or is partway through a restore.
+/// `VSS_SNAPSHOT_TEST_CRASH_CHILD` set, to get a process they can kill while it takes or holds
+/// a snapshot, or is partway through a restore.
 #[test]
 fn crash_child_helper() {
     let Ok(mode) = std::env::var("VSS_SNAPSHOT_TEST_CRASH_CHILD") else {
@@ -368,8 +372,14 @@ fn crash_child_helper() {
     let _held: Box<dyn std::any::Any> = match mode.as_str() {
         "snapshot" => {
             let options = SnapshotOptions::new().with_timeout(TIMEOUT);
-            let snapshots =
-                SnapshotSet::create([env("VSS_SNAPSHOT_TEST_CRASH_VOLUME")], &options).unwrap();
+            let volume = env("VSS_SNAPSHOT_TEST_CRASH_VOLUME");
+            // An earlier kill can leave VSS busy for a moment.
+            let snapshots = loop {
+                match SnapshotSet::create([volume.as_str()], &options) {
+                    Err(error) if error.is_retryable() => thread::sleep(Duration::from_secs(1)),
+                    result => break result.unwrap(),
+                }
+            };
             println!("READY {}", snapshots.volumes()[0].device_path().display());
             Box::new(snapshots)
         }
@@ -403,18 +413,23 @@ impl Drop for KillOnDrop {
     }
 }
 
+fn spawn_child(mode: &str, envs: &[(&str, &str)], stdout: Stdio) -> KillOnDrop {
+    KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["crash_child_helper", "--exact", "--nocapture"])
+            .env("VSS_SNAPSHOT_TEST_CRASH_CHILD", mode)
+            .envs(envs.iter().copied())
+            .stdout(stdout)
+            .spawn()
+            .unwrap(),
+    )
+}
+
 /// Starts `crash_child_helper` and waits until it's ready. Returns the process to kill, and
 /// what it reported.
 fn start_child(mode: &str, envs: &[(&str, &str)]) -> (KillOnDrop, String) {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["crash_child_helper", "--exact", "--nocapture"])
-        .env("VSS_SNAPSHOT_TEST_CRASH_CHILD", mode)
-        .envs(envs.iter().copied())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let child = KillOnDrop(child);
+    let mut child = spawn_child(mode, envs, Stdio::piped());
+    let stdout = child.0.stdout.take().unwrap();
     for line in BufReader::new(stdout).lines() {
         let line = line.unwrap();
         if let Some((_, reported)) = line.split_once("READY ") {
@@ -422,6 +437,26 @@ fn start_child(mode: &str, envs: &[(&str, &str)]) -> (KillOnDrop, String) {
         }
     }
     panic!("the child process stopped before it was ready");
+}
+
+/// Takes a new snapshot after a process was killed, retrying while VSS says it's busy.
+fn snapshot_after_kill(volume: &str, killed: Instant) -> SnapshotSet {
+    let options = SnapshotOptions::new().with_timeout(TIMEOUT);
+    let snapshots = loop {
+        match SnapshotSet::create([volume], &options) {
+            Ok(snapshots) => break snapshots,
+            Err(error) if error.is_retryable() && killed.elapsed() < ORPHAN_LIMIT => {
+                eprintln!("retrying after {:?}: {error}", killed.elapsed());
+                thread::sleep(Duration::from_secs(5));
+            }
+            Err(error) => panic!("a new snapshot failed after the kill: {error}"),
+        }
+    };
+    eprintln!(
+        "MEASURED new snapshot taken {:?} after the kill",
+        killed.elapsed()
+    );
+    snapshots
 }
 
 #[test]
@@ -440,21 +475,7 @@ fn crash_a_killed_processs_snapshot_is_removed_and_new_ones_still_work() {
     drop(child);
     let killed = Instant::now();
 
-    let options = SnapshotOptions::new().with_timeout(TIMEOUT);
-    let snapshots = loop {
-        match SnapshotSet::create([&sql.first], &options) {
-            Ok(snapshots) => break snapshots,
-            Err(error) if error.is_retryable() && killed.elapsed() < ORPHAN_LIMIT => {
-                eprintln!("retrying after {:?}: {error}", killed.elapsed());
-                thread::sleep(Duration::from_secs(5));
-            }
-            Err(error) => panic!("a new snapshot failed after the kill: {error}"),
-        }
-    };
-    eprintln!(
-        "MEASURED new snapshot taken {:?} after the kill",
-        killed.elapsed()
-    );
+    let snapshots = snapshot_after_kill(&sql.first, killed);
     assert_ne!(snapshots.volumes()[0].device_path(), device.as_path());
     snapshots.close().unwrap();
 
@@ -824,4 +845,103 @@ fn a_stopped_writer_service_is_reported() {
         writers.iter().any(|w| w.id == SQL_WRITER),
         "the writer didn't come back"
     );
+}
+
+impl Sql {
+    /// Whether SQL Server's current error log says `database` was frozen for a snapshot, and
+    /// whether it says the database has resumed since.
+    fn freeze_log(&self, database: &str) -> (bool, bool) {
+        let log = self.query(&format!("EXEC xp_readerrorlog 0, 1, N'{database}'"));
+        (
+            log.contains(&format!("I/O is frozen on database {database}")),
+            log.contains(&format!("I/O was resumed on database {database}")),
+        )
+    }
+}
+
+/// Starts taking a snapshot in a child process, and kills it as soon as SQL Server reports
+/// `database` frozen. Returns whether the database was still frozen after the kill. If not,
+/// the kill came too late to show anything.
+fn kill_while_frozen(sql: &Sql, database: &str) -> bool {
+    let mut child = spawn_child(
+        "snapshot",
+        &[("VSS_SNAPSHOT_TEST_CRASH_VOLUME", sql.first.as_str())],
+        Stdio::null(),
+    );
+    let started = Instant::now();
+    while !sql.freeze_log(database).0 {
+        assert!(
+            started.elapsed() < FREEZE_LIMIT,
+            "{database} was never frozen"
+        );
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!("the child process stopped early: {status}");
+        }
+    }
+    drop(child);
+    !sql.freeze_log(database).1
+}
+
+fn shadow_copies_remain() -> bool {
+    let output = Command::new("vssadmin")
+        .args(["list", "shadows"])
+        .output()
+        .expect("vssadmin should be on the PATH");
+    String::from_utf8_lossy(&output.stdout).contains("Shadow Copy ID")
+}
+
+/// Nothing tells the writers that the process asking for the snapshot has gone, so this
+/// checks they don't stay frozen, which would stop the application writing.
+#[test]
+fn crash_writers_recover_when_a_process_is_killed_while_they_are_frozen() {
+    let Some(sql) = crash("crash_writers_recover_when_a_process_is_killed_while_they_are_frozen")
+    else {
+        return;
+    };
+    // A short log keeps each look at it quick, so that a look can land inside the freeze.
+    sql.query("EXEC sp_cycle_errorlog");
+
+    for attempt in 1..=KILL_ATTEMPTS {
+        let name = format!("vssfrozen{attempt}");
+        let _database = Database::create(&sql, &name, &sql.first, &sql.first);
+        if !kill_while_frozen(&sql, &name) {
+            eprintln!("attempt {attempt}: {name} had already resumed, so trying again");
+            continue;
+        }
+        let killed = Instant::now();
+        eprintln!("MEASURED killed while {name} was frozen, on attempt {attempt}");
+
+        while !sql.freeze_log(&name).1 {
+            assert!(
+                killed.elapsed() < FREEZE_LIMIT,
+                "{name} stayed frozen for {FREEZE_LIMIT:?} after the kill"
+            );
+            thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!(
+            "MEASURED {name} resumed {:?} after the kill",
+            killed.elapsed()
+        );
+
+        assert_eq!(sql.state(&name), "ONLINE");
+        sql.insert(&name, 5);
+        assert_eq!(sql.count(&name), ROWS + 5);
+        sql.query(&format!("DBCC CHECKDB ([{name}]) WITH NO_INFOMSGS"));
+
+        snapshot_after_kill(&sql.first, killed).close().unwrap();
+
+        while shadow_copies_remain() {
+            assert!(
+                killed.elapsed() < ORPHAN_LIMIT,
+                "a snapshot outlived its process by {ORPHAN_LIMIT:?}"
+            );
+            thread::sleep(Duration::from_secs(2));
+        }
+        eprintln!(
+            "MEASURED no snapshots left {:?} after the kill",
+            killed.elapsed()
+        );
+        return;
+    }
+    panic!("none of {KILL_ATTEMPTS} kills landed while the writers were frozen");
 }
