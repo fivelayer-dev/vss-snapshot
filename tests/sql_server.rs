@@ -371,7 +371,14 @@ fn crash_child_helper() {
     let env = |name: &str| std::env::var(name).unwrap();
     let _held: Box<dyn std::any::Any> = match mode.as_str() {
         "snapshot" => {
-            let options = SnapshotOptions::new().with_timeout(TIMEOUT);
+            let mut options = SnapshotOptions::new().with_timeout(TIMEOUT);
+            if let Ok(name) = std::env::var("VSS_SNAPSHOT_TEST_CRASH_NAME") {
+                options = options.with_components([ComponentId::new(
+                    env("VSS_SNAPSHOT_TEST_CRASH_WRITER").parse().unwrap(),
+                    env("VSS_SNAPSHOT_TEST_CRASH_PATH"),
+                    name,
+                )]);
+            }
             let volume = env("VSS_SNAPSHOT_TEST_CRASH_VOLUME");
             // An earlier kill can leave VSS busy for a moment.
             let snapshots = loop {
@@ -848,38 +855,50 @@ fn a_stopped_writer_service_is_reported() {
 }
 
 impl Sql {
+    /// Everything SQL Server's current error log says that names `database`.
+    fn database_log(&self, database: &str) -> String {
+        self.query(&format!("EXEC xp_readerrorlog 0, 1, N'{database}'"))
+    }
+
     /// Whether SQL Server's current error log says `database` was frozen for a snapshot, and
     /// whether it says the database has resumed since.
     fn freeze_log(&self, database: &str) -> (bool, bool) {
-        let log = self.query(&format!("EXEC xp_readerrorlog 0, 1, N'{database}'"));
-        (
-            log.contains(&format!("I/O is frozen on database {database}")),
-            log.contains(&format!("I/O was resumed on database {database}")),
-        )
+        let log = self.database_log(database);
+        (log.contains("is frozen"), log.contains("was resumed"))
     }
 }
 
-/// Starts taking a snapshot in a child process, and kills it as soon as SQL Server reports
-/// `database` frozen. Returns whether the database was still frozen after the kill. If not,
-/// the kill came too late to show anything.
-fn kill_while_frozen(sql: &Sql, database: &str) -> bool {
+/// Starts backing up `database` in a child process, and kills it as soon as SQL Server reports
+/// the database frozen. Returns whether it was still frozen after the kill. If not, the kill
+/// came too late to show anything.
+fn kill_while_frozen(database: &Database<'_>) -> bool {
+    let sql = database.sql;
+    let name = database.name.as_str();
+    let (id, _) = database.component();
+    let writer = id.writer_id.to_string();
     let mut child = spawn_child(
         "snapshot",
-        &[("VSS_SNAPSHOT_TEST_CRASH_VOLUME", sql.first.as_str())],
+        &[
+            ("VSS_SNAPSHOT_TEST_CRASH_VOLUME", sql.first.as_str()),
+            ("VSS_SNAPSHOT_TEST_CRASH_WRITER", writer.as_str()),
+            ("VSS_SNAPSHOT_TEST_CRASH_PATH", id.logical_path.as_str()),
+            ("VSS_SNAPSHOT_TEST_CRASH_NAME", id.name.as_str()),
+        ],
         Stdio::null(),
     );
     let started = Instant::now();
-    while !sql.freeze_log(database).0 {
+    while !sql.freeze_log(name).0 {
         assert!(
             started.elapsed() < FREEZE_LIMIT,
-            "{database} was never frozen"
+            "{name} was never frozen. What the error log says about it:\n{}",
+            sql.database_log(name)
         );
         if let Some(status) = child.0.try_wait().unwrap() {
             panic!("the child process stopped early: {status}");
         }
     }
     drop(child);
-    !sql.freeze_log(database).1
+    !sql.freeze_log(name).1
 }
 
 fn shadow_copies_remain() -> bool {
@@ -903,8 +922,8 @@ fn crash_writers_recover_when_a_process_is_killed_while_they_are_frozen() {
 
     for attempt in 1..=KILL_ATTEMPTS {
         let name = format!("vssfrozen{attempt}");
-        let _database = Database::create(&sql, &name, &sql.first, &sql.first);
-        if !kill_while_frozen(&sql, &name) {
+        let database = Database::create(&sql, &name, &sql.first, &sql.first);
+        if !kill_while_frozen(&database) {
             eprintln!("attempt {attempt}: {name} had already resumed, so trying again");
             continue;
         }

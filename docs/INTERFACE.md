@@ -650,7 +650,7 @@ caller decides whether crash-consistent files are good enough.
 - **A 64-bit process on 64-bit Windows.** Otherwise `Error::Wow64NotSupported`, checked before
   any VSS call.
 - **The Volume Shadow Copy service** must not be disabled. Its default, manual start, is fine.
-- **Volumes:** local NTFS or ReFS volumes the system provider supports. Network shares, FAT and
+- **Volumes:** local NTFS or ReFS volumes the system provider supports, both tested on Windows Server 2025. Network shares, FAT and
   removable media are refused with `Error::VolumeNotSupported`.
 - **Reading files** from a snapshot is ordinary file access, and permissions still apply. To
   read files the account can't open, enable `SeBackupPrivilege` and open with
