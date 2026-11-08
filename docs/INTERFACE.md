@@ -667,9 +667,9 @@ Snapshots are always **non-persistent**: they belong to the process that made th
 | `close` or `complete` returns `Err` | Every cleanup step was still attempted. If `DeleteSnapshots` itself failed, the snapshot remains until the process exits, then VSS removes it. |
 | The `SnapshotSet` is dropped (including during a panic unwind) | Same as `close`, with the error discarded. Drop blocks until done, bounded by the timeout per step. |
 | `create` fails | Nothing. Anything created is aborted before it returns. |
-| The process exits, is killed, or calls `std::process::exit` | VSS removes the snapshot itself once it notices. That took about 6 minutes in testing. Writers with selected components get no `BackupComplete`, so they don't record a backup. |
+| The process exits, is killed, or calls `std::process::exit` | VSS removes the snapshot itself once it notices, which took about 6 minutes when tested on Windows Server with writers. A new snapshot of the same volume works straight away, while the old one is still there. Writers with selected components get no `BackupComplete`, so they don't record a backup. |
 | A `Restore` is dropped without `finish` | Writers are told the restore failed. |
-| The process is killed between `Restore::begin` and `finish` | **The application stays in its restoring state** (for SQL Server, the database stays `RESTORING`). Nothing tells the writer the process has gone. Running the restore again fixes it, so record that a restore has started before calling `begin`. |
+| The process is killed between `Restore::begin` and `finish` | **The application stays in its restoring state** (for SQL Server, the database was still `RESTORING` 2 minutes later, when testing stopped watching). Nothing tells the writer the process has gone. Running the restore again fixes it, as tested on SQL Server Express, so record that a restore has started before calling `begin`. |
 
 Nothing in this crate creates persistent snapshots, so there is never anything for a later run
 to find and delete.
