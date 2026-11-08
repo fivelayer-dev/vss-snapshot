@@ -30,7 +30,7 @@
 //!
 //! The full interface, including the lifecycle, threading, privileges and cleanup
 //! guarantees, is defined in
-//! [docs/INTERFACE.md](https://github.com/davejp/vss-snapshot/blob/main/docs/INTERFACE.md).
+//! [docs/INTERFACE.md](https://github.com/fivelayer-dev/vss-snapshot/blob/main/docs/INTERFACE.md).
 //!
 //! On targets other than Windows this crate is empty.
 #![cfg(windows)]

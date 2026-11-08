@@ -1,6 +1,6 @@
 # vss-snapshot
 
-[![CI](https://github.com/davejp/vss-snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/davejp/vss-snapshot/actions/workflows/ci.yml)
+[![CI](https://github.com/fivelayer-dev/vss-snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/fivelayer-dev/vss-snapshot/actions/workflows/ci.yml)
 
 Take temporary, read-only Windows Volume Shadow Copy (VSS) snapshots from Rust, so your program
 can read every file as it was at one moment, including files that are open or locked.
@@ -25,7 +25,7 @@ can read every file as it was at one moment, including files that are open or lo
 
 ```toml
 [target.'cfg(windows)'.dependencies]
-vss-snapshot = { git = "https://github.com/davejp/vss-snapshot" }
+vss-snapshot = { git = "https://github.com/fivelayer-dev/vss-snapshot" }
 ```
 
 ```rust
