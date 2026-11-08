@@ -58,7 +58,7 @@ look as they would after a power cut:
 ```rust
 use vss_snapshot::{Consistency, SnapshotOptions};
 
-let options = SnapshotOptions::new().consistency(Consistency::Crash);
+let options = SnapshotOptions::new().with_consistency(Consistency::Crash);
 ```
 
 ## Requirements

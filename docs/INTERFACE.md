@@ -5,7 +5,8 @@ errors, threading, the privileges it needs, what it guarantees about cleanup, an
 deliberately doesn't do. The rustdoc on each item is the detailed reference. Where they differ,
 this document states the intent and the rustdoc is a bug.
 
-**Status:** proposed. Nothing here is implemented yet.
+**Status:** being implemented. The value types, errors and options exist; taking snapshots,
+listing writers and restoring don't yet.
 
 ## Contents
 
@@ -130,19 +131,20 @@ pub struct SnapshotOptions { /* private */ }
 impl SnapshotOptions {
     /// Application-consistent, a 10-minute timeout per step, no components.
     pub fn new() -> SnapshotOptions;
-    pub fn consistency(self, consistency: Consistency) -> SnapshotOptions;
-    /// The longest to wait for each VSS step, such as freezing writers.
-    pub fn timeout(self, timeout: Duration) -> SnapshotOptions;
-    /// Writer components to back up, so the backup can be restored through the
-    /// writer. Needs `Consistency::Application`, and every volume holding the
-    /// components' files (see `Component::volumes`).
-    pub fn components<I>(self, components: I) -> SnapshotOptions
+    pub fn with_consistency(self, consistency: Consistency) -> SnapshotOptions;
+    /// The longest to wait for each VSS step, such as freezing writers. Must be
+    /// more than zero.
+    pub fn with_timeout(self, timeout: Duration) -> SnapshotOptions;
+    /// Writer components to back up, replacing any set before, so the backup can
+    /// be restored through the writer. Needs `Consistency::Application`, and every
+    /// volume holding the components' files (see `Component::volumes`).
+    pub fn with_components<I>(self, components: I) -> SnapshotOptions
     where
         I: IntoIterator<Item = ComponentId>;
 
-    pub fn get_consistency(&self) -> Consistency;
-    pub fn get_timeout(&self) -> Duration;
-    pub fn get_components(&self) -> &[ComponentId];
+    pub fn consistency(&self) -> Consistency;
+    pub fn timeout(&self) -> Duration;
+    pub fn components(&self) -> &[ComponentId];
 }
 
 impl Default for SnapshotOptions { /* same as new() */ }
@@ -274,6 +276,9 @@ impl ComponentId {
         -> ComponentId;
 }
 
+/// `HOST\SQLEXPRESS\sales (writer {a65faa63-5ea8-4ebc-9dbd-a0c4db26912a})`
+impl fmt::Display for ComponentId;
+
 /// A set of files a writer names. A pattern, not a list: `path` can hold
 /// environment variables and `filespec` wildcards.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,7 +310,15 @@ pub enum RestoreMethod {
     RestoreStopStart,
     Other(i32),
 }
+
+impl RestoreMethod {
+    /// The VSS constant's name, or `"unknown"` for `Other`.
+    pub fn vss_name(self) -> &'static str;
+}
 ```
+
+For `WriterState` and `RestoreMethod`, `Display` of an `Other` value says it's unknown and
+gives the number, such as `unknown writer state 16`.
 
 ### Restore through writers
 
@@ -356,8 +369,8 @@ pub struct RestoreOptions { /* private */ }
 impl RestoreOptions {
     /// A 10-minute timeout per step.
     pub fn new() -> RestoreOptions;
-    pub fn timeout(self, timeout: Duration) -> RestoreOptions;
-    pub fn get_timeout(&self) -> Duration;
+    pub fn with_timeout(self, timeout: Duration) -> RestoreOptions;
+    pub fn timeout(&self) -> Duration;
 }
 
 impl Default for RestoreOptions { /* same as new() */ }
@@ -501,7 +514,10 @@ pub enum Error {
 
 impl Error {
     /// Whether the same call might succeed later: `SnapshotInProgress`, `Timeout`,
-    /// and the VSS codes for writers too slow to flush or hold writes.
+    /// and, as `Vss` or `WriterFailed`, the codes VSS marks as temporary:
+    /// `VSS_E_FLUSH_WRITES_TIMEOUT`, `VSS_E_HOLD_WRITES_TIMEOUT`,
+    /// `VSS_E_WRITERERROR_TIMEOUT`, `VSS_E_WRITERERROR_RETRYABLE` and
+    /// `VSS_E_WRITERERROR_OUTOFRESOURCES`.
     pub fn is_retryable(&self) -> bool;
 }
 
