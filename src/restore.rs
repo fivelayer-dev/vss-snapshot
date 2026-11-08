@@ -218,10 +218,12 @@ impl Session {
     /// Tells the writers whether the files were restored, then lets them finish. Every step
     /// is attempted, and the first failure is returned.
     fn finish(&self, restored: bool) -> Result<Vec<WriterStatus>> {
-        let marked = self.selected.iter().fold(Ok(()), |result, component| {
+        // Every writer hears, even if telling an earlier one failed.
+        let mut marked = Ok(());
+        for component in &self.selected {
             let status = self.backup.set_file_restore_status(component, restored);
-            result.and(status)
-        });
+            marked = marked.and(status);
+        }
         let finished = self.backup.post_restore();
         marked.and(finished)?;
         self.check_writers()
