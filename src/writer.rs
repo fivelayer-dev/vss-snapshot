@@ -220,11 +220,12 @@ pub struct Component {
     pub selectable: bool,
     /// Whether it can be chosen on its own for a restore.
     pub selectable_for_restore: bool,
-    /// Its files.
+    /// Its files. A writer chooses which of these three lists to use, so a backup must copy
+    /// all of them. SQL Server lists a database's data and log files here.
     pub files: Vec<FileSpec>,
-    /// Its database files.
+    /// Its database files, for a writer that lists them separately.
     pub database_files: Vec<FileSpec>,
-    /// Its database log files.
+    /// Its database log files, for a writer that lists them separately.
     pub log_files: Vec<FileSpec>,
 }
 

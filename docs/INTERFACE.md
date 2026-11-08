@@ -251,6 +251,8 @@ pub struct Component {
     /// Whether it can be chosen on its own. If not, it comes with its writer.
     pub selectable: bool,
     pub selectable_for_restore: bool,
+    /// A writer chooses which of these three lists to use, so a backup must copy all
+    /// of them. SQL Server lists a database's data and log files in `files`.
     pub files: Vec<FileSpec>,
     pub database_files: Vec<FileSpec>,
     pub log_files: Vec<FileSpec>,

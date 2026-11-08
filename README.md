@@ -78,7 +78,7 @@ let id = writer.component_id(database);
 
 let options = SnapshotOptions::new().with_components([id.clone()]);
 let snapshots = SnapshotSet::create(database.volumes()?, &options)?;
-// Copy database.database_files and database.log_files out of the snapshot, and store them.
+// Copy everything in database.files, database_files and log_files out of the snapshot.
 let document = snapshots.complete()?;
 // Store document.as_xml() and the id with the backup.
 ```

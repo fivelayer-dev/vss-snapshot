@@ -59,6 +59,12 @@ fn sql(test: &str) -> Option<Sql> {
 impl Sql {
     /// Runs a query with `sqlcmd`, and returns what it printed.
     fn query(&self, query: &str) -> String {
+        self.try_query(query)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Like `query`, for cleanup, which mustn't panic while a failed test is unwinding.
+    fn try_query(&self, query: &str) -> Result<String, String> {
         let output = Command::new("sqlcmd")
             .args([
                 "-S",
@@ -73,14 +79,16 @@ impl Sql {
                 query,
             ])
             .output()
-            .expect("sqlcmd should be on the PATH");
+            .map_err(|error| format!("sqlcmd should be on the PATH: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        assert!(
-            output.status.success(),
-            "{query}\n{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        stdout
+        if output.status.success() {
+            Ok(stdout)
+        } else {
+            Err(format!(
+                "{query}\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
     }
 
     fn count(&self, database: &str) -> u64 {
@@ -135,13 +143,20 @@ impl<'a> Database<'a> {
         database
     }
 
-    fn drop_if_there(&self) {
+    /// The query that drops the database. Only an online database can be altered, and a
+    /// failed restore can leave it `RESTORING`.
+    fn drop_query(&self) -> String {
         let name = &self.name;
-        self.sql.query(&format!(
+        format!(
             "IF DB_ID('{name}') IS NOT NULL BEGIN \
+             IF DATABASEPROPERTYEX('{name}', 'Status') = 'ONLINE' \
              ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
              DROP DATABASE [{name}]; END"
-        ));
+        )
+    }
+
+    fn drop_if_there(&self) {
+        self.sql.query(&self.drop_query());
     }
 
     /// The database's component, from the SQL Server writer.
@@ -189,22 +204,33 @@ impl<'a> Database<'a> {
 
 impl Drop for Database<'_> {
     fn drop(&mut self) {
-        self.drop_if_there();
+        let _ = self.sql.try_query(&self.drop_query());
         let _ = fs::remove_dir_all(&self.backup);
     }
 }
 
-/// The component's database and log files. SQL Server names each file exactly.
+/// All of the component's files. SQL Server names each file exactly, and lists a database's
+/// data and log files together in `files`.
 fn files(component: &Component) -> Vec<PathBuf> {
-    component
-        .database_files
+    let files: Vec<PathBuf> = component
+        .files
         .iter()
+        .chain(&component.database_files)
         .chain(&component.log_files)
         .map(|spec| {
             assert!(!spec.filespec.contains('*'), "{spec:?}");
             Path::new(&spec.path).join(&spec.filespec)
         })
-        .collect()
+        .collect();
+    assert!(!files.is_empty(), "no files in {component:?}");
+    files
+}
+
+fn has_extension(files: &[PathBuf], extension: &str) -> bool {
+    files.iter().any(|file| {
+        file.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(extension))
+    })
 }
 
 #[test]
@@ -216,8 +242,9 @@ fn the_sql_server_writer_lists_a_database_and_its_volumes() {
     let (id, component) = database.component();
     eprintln!("{id}\n{component:?}");
     assert_eq!(id.writer_id, SQL_WRITER);
-    assert_eq!(component.database_files.len(), 1);
-    assert_eq!(component.log_files.len(), 1);
+    let listed = files(&component);
+    assert!(has_extension(&listed, "mdf"), "{listed:?}");
+    assert!(has_extension(&listed, "ldf"), "{listed:?}");
     assert_eq!(
         component.volumes().unwrap(),
         [format!(r"{}\", sql.first), format!(r"{}\", sql.second)]
