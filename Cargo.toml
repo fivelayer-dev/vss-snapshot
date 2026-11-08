@@ -1,0 +1,28 @@
+[package]
+name = "vss-snapshot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["David Anderson"]
+description = "Take temporary Windows Volume Shadow Copy (VSS) snapshots, with VSS writer support."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/davejp/vss-snapshot"
+readme = "README.md"
+keywords = ["vss", "shadow-copy", "snapshot", "backup", "windows"]
+categories = ["os::windows-apis", "filesystem"]
+include = ["src/**", "README.md", "CHANGELOG.md", "LICENSE-*", "docs/INTERFACE.md"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Vss",
+    "Win32_System_Com",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
