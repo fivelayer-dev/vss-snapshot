@@ -1,9 +1,14 @@
 use std::fmt;
+use std::thread;
+use std::time::Duration;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::guid::Guid;
 use crate::hresult::HResult;
+use crate::options::Consistency;
 use crate::sys;
+use crate::sys::com::Apartment;
+use crate::sys::vss::Backup;
 
 /// What a VSS writer reported after a snapshot was taken, or during a restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,7 +175,7 @@ impl fmt::Display for WriterState {
     }
 }
 
-/// A writer on this machine and what it looks after, from `list_writers`.
+/// A writer on this machine and what it looks after, from [`list_writers`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriterInfo {
@@ -225,7 +230,7 @@ pub struct Component {
 
 impl Component {
     /// The volumes holding this component's files, each listed once, to pass to
-    /// `SnapshotSet::create`. Each is a drive such as `C:\`,
+    /// [`SnapshotSet::create`](crate::SnapshotSet::create). Each is a drive such as `C:\`,
     /// or a GUID path for a volume with no drive letter.
     ///
     /// Environment variables in the paths, such as `%SystemRoot%`, are expanded. This only
@@ -418,9 +423,108 @@ impl fmt::Display for RestoreMethod {
     }
 }
 
+/// Lists the VSS writers on this machine and what each looks after, such as each SQL Server
+/// database and its files.
+///
+/// This takes no snapshot and pauses nothing. `timeout` is the longest to wait for the
+/// writers to answer. Needs an elevated process, SYSTEM, or a member of Backup Operators.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use vss_snapshot::list_writers;
+///
+/// # fn main() -> vss_snapshot::Result<()> {
+/// for writer in list_writers(Duration::from_secs(60))? {
+///     println!("{} {}", writer.id, writer.name);
+///     for component in &writer.components {
+///         println!("  {} {}", component.logical_path, component.name);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub fn list_writers(timeout: Duration) -> Result<Vec<WriterInfo>> {
+    if timeout.is_zero() {
+        return Err(Error::InvalidOptions {
+            reason: "the timeout must be more than zero",
+        });
+    }
+    if cfg!(target_pointer_width = "32") && sys::process::is_wow64()? {
+        return Err(Error::Wow64NotSupported);
+    }
+    thread::Builder::new()
+        .name("vss-list-writers".to_owned())
+        .spawn(move || {
+            let _apartment = Apartment::enter()?;
+            let backup = Backup::create(timeout)?;
+            backup.initialize_for_backup()?;
+            backup.set_context(Consistency::Application)?;
+            backup.set_copy_backup(false)?;
+            backup.gather_writer_metadata()?;
+            let writers = backup.gathered_writers();
+            let freed = backup.free_writer_metadata();
+            let writers = writers?;
+            freed?;
+            Ok(writers.into_iter().map(|writer| writer.info).collect())
+        })?
+        .join()
+        .unwrap_or(Err(Error::Internal {
+            reason: "the thread listing writers panicked",
+        }))
+}
+
+/// The statuses of the given writers, or [`Error::WriterFailed`] for the first of them that
+/// failed. Other writers may have failed for reasons unrelated to these components, so
+/// they're left out.
+pub(crate) fn check_writers(
+    statuses: &[WriterStatus],
+    writers: &[Guid],
+) -> Result<Vec<WriterStatus>> {
+    let selected: Vec<WriterStatus> = statuses
+        .iter()
+        .filter(|status| writers.contains(&status.id))
+        .cloned()
+        .collect();
+    match selected.iter().find(|status| status.is_failed()) {
+        Some(failed) => Err(Error::WriterFailed {
+            writer: failed.name.clone(),
+            state: failed.state,
+            failure: failed.failure,
+        }),
+        None => Ok(selected),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_given_writers_are_checked() {
+        let other = Guid::from_u128(2);
+        let statuses = [
+            WriterStatus::new(SQL_WRITER, "SqlServerWriter".to_owned(), 1, 0),
+            WriterStatus::new(other, "Other".to_owned(), 9, 0),
+        ];
+        let checked = check_writers(&statuses, &[SQL_WRITER]).unwrap();
+        assert_eq!(checked, statuses[..1]);
+        assert!(check_writers(&statuses, &[]).unwrap().is_empty());
+        match check_writers(&statuses, &[SQL_WRITER, other]) {
+            Err(Error::WriterFailed { writer, state, .. }) => {
+                assert_eq!(writer, "Other");
+                assert_eq!(state, WriterState::FailedAtFreeze);
+            }
+            result => panic!("{result:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_timeout_is_refused_without_touching_vss() {
+        assert!(matches!(
+            list_writers(Duration::ZERO),
+            Err(Error::InvalidOptions { .. })
+        ));
+    }
 
     const SQL_WRITER: Guid = Guid::from_u128(0xa65faa63_5ea8_4ebc_9dbd_a0c4db26912a);
 

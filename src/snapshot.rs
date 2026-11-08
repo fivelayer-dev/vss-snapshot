@@ -5,14 +5,15 @@ use std::thread::{self, JoinHandle};
 
 use windows::core::GUID;
 
+use crate::document::BackupDocument;
 use crate::error::{Error, Result};
 use crate::guid::Guid;
 use crate::options::{Consistency, SnapshotOptions};
 use crate::sys;
 use crate::sys::com::Apartment;
-use crate::sys::vss::{to_guid, Backup};
+use crate::sys::vss::{find_component, to_guid, Backup, Selected};
 use crate::volume::{normalize_volume_name, system_time_from_filetime, SplitPath, VolumeSnapshot};
-use crate::writer::WriterStatus;
+use crate::writer::{check_writers, ComponentId, WriterStatus};
 
 /// VSS creates one snapshot set at a time per machine. Creations in this process take
 /// turns, so they don't fail each other with `SnapshotInProgress`.
@@ -50,6 +51,7 @@ pub struct SnapshotSet {
     id: Guid,
     volumes: Vec<VolumeSnapshot>,
     writers: Vec<WriterStatus>,
+    has_components: bool,
     worker: Option<Worker>,
 }
 
@@ -57,12 +59,14 @@ pub struct SnapshotSet {
 #[derive(Debug)]
 struct Worker {
     end: Sender<Ending>,
-    thread: JoinHandle<Result<()>>,
+    thread: JoinHandle<Result<Option<BackupDocument>>>,
 }
 
 /// How the set ends. If the sender is dropped without sending, it closes.
 #[derive(Debug)]
 enum Ending {
+    /// The backup is stored: tell the selected components' writers it succeeded.
+    Complete,
     Close,
 }
 
@@ -94,6 +98,10 @@ impl SnapshotSet {
     /// snapshots exist, which with writers can take several seconds. Volume names and
     /// options are checked before VSS is involved.
     ///
+    /// With [`SnapshotOptions::with_components`], fails with [`Error::ComponentNotFound`]
+    /// if a component isn't on this machine, and with [`Error::WriterFailed`] if one of
+    /// their writers failed, which usually means a volume holding their files was left out.
+    ///
     /// For an incremental backup that uses the USN journal, read each volume's journal
     /// position before calling this, so every change you're told about is in the snapshot.
     pub fn create<I, S>(volumes: I, options: &SnapshotOptions) -> Result<SnapshotSet>
@@ -102,11 +110,6 @@ impl SnapshotSet {
         S: AsRef<str>,
     {
         options.validate()?;
-        if !options.components().is_empty() {
-            return Err(Error::InvalidOptions {
-                reason: "selecting components isn't supported yet",
-            });
-        }
         let mut names = Vec::new();
         for given in volumes {
             let given = given.as_ref();
@@ -123,6 +126,7 @@ impl SnapshotSet {
         let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
         let (created_tx, created_rx) = channel();
         let (end_tx, end_rx) = channel();
+        let has_components = !options.components().is_empty();
         let options = options.clone();
         let thread = thread::Builder::new()
             .name("vss-snapshot".to_owned())
@@ -133,6 +137,7 @@ impl SnapshotSet {
                 id: created.id,
                 volumes: created.volumes,
                 writers: created.writers,
+                has_components,
                 worker: Some(Worker {
                     end: end_tx,
                     thread,
@@ -187,24 +192,45 @@ impl SnapshotSet {
     /// What each writer reported once the snapshots were taken. Empty for
     /// [`Consistency::Crash`].
     ///
-    /// A failed writer doesn't stop the snapshot being taken. Its files are only
-    /// crash-consistent, so check [`WriterStatus::is_failed`] and decide what to do.
+    /// A failed writer with no selected component doesn't stop the snapshot being taken.
+    /// Its files are only crash-consistent, so check [`WriterStatus::is_failed`] and decide
+    /// what to do.
     pub fn writers(&self) -> &[WriterStatus] {
         &self.writers
     }
 
     /// Removes the snapshots, and reports any failure, which dropping the set can't. Paths
-    /// inside the snapshots stop working.
+    /// inside the snapshots stop working. If components were selected, their writers are
+    /// told the backup didn't succeed.
     ///
     /// Every cleanup step is attempted even if an earlier one fails. If removing the
     /// snapshots itself fails, VSS removes them when the process exits.
     pub fn close(mut self) -> Result<()> {
-        self.end(Ending::Close)
+        self.end(Ending::Close).map(|_| ())
     }
 
-    fn end(&mut self, ending: Ending) -> Result<()> {
+    /// Tells the selected components' writers that the backup succeeded, removes the
+    /// snapshots, and returns the document a restore through the writers needs. Call this
+    /// only once the backup is safely stored, and store the document with it.
+    ///
+    /// Fails with [`Error::WriterFailed`] if one of those writers has failed since the
+    /// snapshot was taken, so a backup is never recorded as good when it isn't. Fails with
+    /// [`Error::InvalidOptions`] if no components were selected; use
+    /// [`close`](SnapshotSet::close) for those. Either way, the snapshots are removed.
+    pub fn complete(mut self) -> Result<BackupDocument> {
+        if !self.has_components {
+            return Err(Error::InvalidOptions {
+                reason: "complete needs selected components; use close instead",
+            });
+        }
+        self.end(Ending::Complete)?.ok_or(Error::Internal {
+            reason: "the snapshot thread completed without a document",
+        })
+    }
+
+    fn end(&mut self, ending: Ending) -> Result<Option<BackupDocument>> {
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let _ = worker.end.send(ending);
         worker.thread.join().unwrap_or(Err(Error::Internal {
@@ -252,7 +278,7 @@ fn run(
     options: &SnapshotOptions,
     created: &Sender<Result<Created>>,
     end: &Receiver<Ending>,
-) -> Result<()> {
+) -> Result<Option<BackupDocument>> {
     let session = match Session::start(targets, options) {
         Ok((session, info)) => {
             let _ = created.send(Ok(info));
@@ -260,13 +286,12 @@ fn run(
         }
         Err(error) => {
             let _ = created.send(Err(error));
-            return Ok(());
+            return Ok(None);
         }
     };
     // A closed channel means the set was dropped, which also closes it.
-    match end.recv() {
-        Ok(Ending::Close) | Err(_) => session.close(),
-    }
+    let succeeded = matches!(end.recv(), Ok(Ending::Complete));
+    session.finish(succeeded)
 }
 
 /// One snapshot set's VSS session. Fields drop in order, so the backup components object is
@@ -275,6 +300,7 @@ struct Session {
     backup: Backup,
     set: GUID,
     consistency: Consistency,
+    selected: Vec<Selected>,
     _apartment: Apartment,
 }
 
@@ -284,15 +310,19 @@ impl Session {
         let backup = Backup::create(options.timeout())?;
         backup.initialize_for_backup()?;
         backup.set_context(options.consistency())?;
-        backup.set_copy_backup(false)?;
+        backup.set_copy_backup(!options.components().is_empty())?;
         let with_writers = options.consistency() == Consistency::Application;
+        let mut selected = Vec::new();
         if with_writers {
             backup.gather_writer_metadata()?;
-            backup.free_writer_metadata()?;
+            let added = add_components(&backup, options.components());
+            let freed = backup.free_writer_metadata();
+            selected = added?;
+            freed?;
         }
 
         let set = backup.start_snapshot_set()?;
-        match take_snapshots(&backup, targets, with_writers) {
+        match take_snapshots(&backup, targets, with_writers, &selected) {
             Ok((volumes, writers)) => {
                 let created = Created {
                     id: to_guid(set),
@@ -303,6 +333,7 @@ impl Session {
                     backup,
                     set,
                     consistency: options.consistency(),
+                    selected,
                     _apartment: apartment,
                 };
                 Ok((session, created))
@@ -315,22 +346,81 @@ impl Session {
         }
     }
 
-    /// Tells writers the backup is over, then removes the snapshots. Both are attempted,
-    /// and the first failure is returned.
-    fn close(self) -> Result<()> {
+    /// Ends the backup and removes the snapshots, attempting every step and returning the
+    /// first failure.
+    ///
+    /// If the backup `succeeded`, the selected writers are checked again and told so, and
+    /// the document is saved after `BackupComplete`, so that it includes what writers add
+    /// then. Otherwise they're told nothing, which records no backup.
+    fn finish(self, succeeded: bool) -> Result<Option<BackupDocument>> {
+        let marked = if succeeded {
+            self.check_selected_writers().and_then(|_| {
+                self.selected
+                    .iter()
+                    .try_for_each(|component| self.backup.set_backup_succeeded(component))
+            })
+        } else {
+            Ok(())
+        };
         let completed = match self.consistency {
             Consistency::Application => self.backup.backup_complete(),
             Consistency::Crash => Ok(()),
         };
+        let document = match (&marked, &completed) {
+            (Ok(()), Ok(())) if succeeded => self
+                .backup
+                .save_as_xml()
+                .map(|xml| Some(BackupDocument::from_xml(xml))),
+            _ => Ok(None),
+        };
         let deleted = self.backup.delete_snapshot_set(self.set);
-        completed.and(deleted)
+        marked.and(completed).and(deleted)?;
+        document
     }
+
+    fn check_selected_writers(&self) -> Result<Vec<WriterStatus>> {
+        let statuses = self.backup.writer_statuses()?;
+        check_writers(&statuses, &selected_writers(&self.selected))
+    }
+}
+
+/// Adds each wanted component, once, to the backup. Call between gathering and freeing the
+/// writer metadata.
+fn add_components(backup: &Backup, wanted: &[ComponentId]) -> Result<Vec<Selected>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let writers = backup.gathered_writers()?;
+    let mut selected: Vec<Selected> = Vec::with_capacity(wanted.len());
+    for id in wanted {
+        if selected.iter().any(|component| component.id == *id) {
+            continue;
+        }
+        let component = find_component(&writers, id).ok_or_else(|| Error::ComponentNotFound {
+            component: id.clone(),
+        })?;
+        backup.add_component(&component)?;
+        selected.push(component);
+    }
+    Ok(selected)
+}
+
+/// The writers of the selected components, each once.
+pub(crate) fn selected_writers(selected: &[Selected]) -> Vec<Guid> {
+    let mut writers = Vec::new();
+    for component in selected {
+        if !writers.contains(&component.id.writer_id) {
+            writers.push(component.id.writer_id);
+        }
+    }
+    writers
 }
 
 fn take_snapshots(
     backup: &Backup,
     targets: &[Target],
     with_writers: bool,
+    selected: &[Selected],
 ) -> Result<(Vec<VolumeSnapshot>, Vec<WriterStatus>)> {
     let mut ids = Vec::with_capacity(targets.len());
     for target in targets {
@@ -346,6 +436,10 @@ fn take_snapshots(
     } else {
         Vec::new()
     };
+    // A selected component's files aren't consistent if its writer failed, though the
+    // snapshot was still taken, so this has to be checked.
+    check_writers(&writers, &selected_writers(selected))?;
+
     let mut volumes = Vec::with_capacity(targets.len());
     for (target, id) in targets.iter().zip(ids) {
         let properties = backup.snapshot_properties(id)?;
@@ -364,13 +458,24 @@ fn take_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::ComponentId;
     use std::time::Duration;
 
     #[test]
     fn a_snapshot_set_can_move_between_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SnapshotSet>();
+    }
+
+    #[test]
+    fn each_selected_writer_is_listed_once() {
+        let sql = Guid::from_u128(1);
+        let other = Guid::from_u128(2);
+        let selected = [
+            Selected::new(ComponentId::new(sql, "", "a"), GUID::zeroed(), 2),
+            Selected::new(ComponentId::new(other, "", "b"), GUID::zeroed(), 2),
+            Selected::new(ComponentId::new(sql, "", "c"), GUID::zeroed(), 2),
+        ];
+        assert_eq!(selected_writers(&selected), [sql, other]);
     }
 
     // Each of these fails before VSS is involved, so none takes a snapshot.
@@ -397,10 +502,11 @@ mod tests {
             SnapshotSet::create(["C:"], &zero),
             Err(Error::InvalidOptions { .. })
         ));
-        let components =
-            SnapshotOptions::new().with_components([ComponentId::new(Guid::from_u128(1), "", "x")]);
+        let crash_with_components = SnapshotOptions::new()
+            .with_consistency(Consistency::Crash)
+            .with_components([ComponentId::new(Guid::from_u128(1), "", "x")]);
         assert!(matches!(
-            SnapshotSet::create(["C:"], &components),
+            SnapshotSet::create(["C:"], &crash_with_components),
             Err(Error::InvalidOptions { .. })
         ));
     }

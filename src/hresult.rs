@@ -74,6 +74,7 @@ const KNOWN: &[(i32, &str)] = known![
     foundation::E_INVALIDARG,
     foundation::E_NOTIMPL,
     foundation::E_OUTOFMEMORY,
+    foundation::E_POINTER,
     foundation::E_UNEXPECTED,
     foundation::CO_E_NOTINITIALIZED,
     foundation::RPC_E_CHANGED_MODE,

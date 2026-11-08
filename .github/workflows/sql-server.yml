@@ -1,0 +1,59 @@
+name: SQL Server
+
+# Backup and restore through SQL Server's VSS writer. Installing SQL Server Express takes
+# several minutes, so this runs weekly and when started from the Actions tab, not on push.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sql-server:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Make the test volumes
+        run: ./.github/scripts/make-test-volumes.ps1
+
+      - name: Install SQL Server Express
+        run: |
+          choco install sql-server-express -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Start-Service SQLWriter
+          Get-Service *SQL* | Format-Table Name, Status, StartType
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";$env:Path"
+          Split-Path (Get-Command sqlcmd).Source | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      # Each test database keeps its files on the test volumes, in folders SQL Server's
+      # service account may write to.
+      - name: Let SQL Server use the test volumes
+        run: |
+          foreach ($folder in 'V:\sql', 'W:\sql') {
+            New-Item -ItemType Directory -Path $folder | Out-Null
+            icacls $folder /grant 'NT SERVICE\MSSQL$SQLEXPRESS:(OI)(CI)F'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Run the SQL Server tests
+        env:
+          VSS_SNAPSHOT_TEST_VOLUMES: "V:,W:"
+          VSS_SNAPSHOT_TEST_SQL_INSTANCE: '.\SQLEXPRESS'
+        run: cargo test --test sql_server -- --nocapture
+
+      - name: Check no snapshots were left behind
+        if: always()
+        run: |
+          $shadows = vssadmin list shadows | Out-String
+          $shadows
+          if ($shadows -match 'Shadow Copy ID') { exit 1 }
+          exit 0

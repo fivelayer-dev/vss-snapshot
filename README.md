@@ -5,10 +5,9 @@
 Take temporary, read-only Windows Volume Shadow Copy (VSS) snapshots from Rust, so your program
 can read every file as it was at one moment, including files that are open or locked.
 
-> **Status:** under development. Taking, reading and removing snapshots is implemented, with
-> tests that take real snapshots on GitHub's Windows runners. Listing writers, selecting components and restoring through
-> writers are next. The interface is defined in [docs/INTERFACE.md](docs/INTERFACE.md). It
-> isn't on crates.io yet.
+> **Status:** early. Everything in [docs/INTERFACE.md](docs/INTERFACE.md) is implemented, with
+> tests that take real snapshots on GitHub's Windows runners. Backup and restore through
+> writers is tested with SQL Server Express only. It isn't on crates.io yet.
 
 - **Safe API.** All COM and VSS calls are private. Errors are typed, and the library doesn't
   panic.
@@ -18,8 +17,8 @@ can read every file as it was at one moment, including files that are open or lo
   thread's COM apartment.
 - **Writer support.** Databases and other VSS-aware applications can make their files
   consistent first. You can also select writer components and restore through the writer.
-- **No runtime dependencies.** VSS is part of Windows. The only Rust dependency is the
-  official [`windows`](https://crates.io/crates/windows) crate.
+- **No runtime dependencies.** VSS is part of Windows. The only Rust dependencies are
+  Microsoft's official [`windows`](https://crates.io/crates/windows) and `windows-core` crates.
 
 ## Quick start
 
@@ -62,6 +61,43 @@ use vss_snapshot::{Consistency, SnapshotOptions};
 let options = SnapshotOptions::new().with_consistency(Consistency::Crash);
 ```
 
+## Backing up and restoring through a writer
+
+Without selected components, writers make their files consistent, but the backup can't be
+restored through them. To back up so that it can, select the component and include every
+volume its files are on:
+
+```rust
+use std::time::Duration;
+use vss_snapshot::{list_writers, SnapshotOptions, SnapshotSet};
+
+let writers = list_writers(Duration::from_secs(60))?;
+let writer = writers.iter().find(|w| w.name == "SqlServerWriter").unwrap();
+let database = writer.components.iter().find(|c| c.name == "sales").unwrap();
+let id = writer.component_id(database);
+
+let options = SnapshotOptions::new().with_components([id.clone()]);
+let snapshots = SnapshotSet::create(database.volumes()?, &options)?;
+// Copy database.database_files and database.log_files out of the snapshot, and store them.
+let document = snapshots.complete()?;
+// Store document.as_xml() and the id with the backup.
+```
+
+To restore, let the writer prepare, put the files back, then let it finish:
+
+```rust
+use vss_snapshot::{Restore, RestoreOptions};
+
+let restore = Restore::begin(&document, &[id], &RestoreOptions::new())?;
+// Copy the stored files back to where they were.
+restore.finish()?;
+```
+
+**`Restore::begin` changes the live system** before any file is copied: SQL Server takes an
+online database out of service. `abort` before copying leaves it as it was. If the process is
+killed between `begin` and `finish`, the database stays in its restoring state until a restore
+is run again, so record that a restore has started first.
+
 ## Requirements
 
 - 64-bit Windows, and a 64-bit process.
@@ -93,6 +129,9 @@ threading, privileges and cleanup guarantees.
 only on GitHub Actions, where each run gets a disposable, elevated machine and snapshots small
 virtual disks the workflow creates. Everywhere else they print `SKIPPED` and pass, even when
 elevated. A passing local `cargo test` doesn't show that snapshots work, so check the CI run.
+
+Backup and restore through SQL Server's writer is tested by a separate workflow, which installs
+SQL Server Express. It runs weekly, and can be started from the Actions tab.
 
 ## Licence
 

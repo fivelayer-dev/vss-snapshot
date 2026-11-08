@@ -5,8 +5,8 @@ errors, threading, the privileges it needs, what it guarantees about cleanup, an
 deliberately doesn't do. The rustdoc on each item is the detailed reference. Where they differ,
 this document states the intent and the rustdoc is a bug.
 
-**Status:** being implemented. Snapshots work; selecting components, `complete`,
-`list_writers` and `Restore` don't exist yet.
+**Status:** implemented. Backup and restore through writers is tested with SQL Server
+Express only.
 
 ## Contents
 
@@ -519,10 +519,34 @@ it. It takes no snapshot and pauses no application.
 
 ### A restore
 
-```text
-Restore::begin ──► (caller copies stored files back) ──► finish
-                                                     ├► abort
-                                                     └► drop   (same as abort)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your program
+    participant Restore
+    participant VSS
+    participant W as Writer
+
+    App->>Restore: begin(document, components, options)
+    Restore->>VSS: InitializeForRestore, GatherWriterMetadata
+    Restore->>VSS: SetSelectedForRestore, SetAdditionalRestores(false)
+    Restore->>VSS: PreRestore
+    VSS->>W: pre-restore
+    Note over W: The live application changes here.<br/>SQL Server takes the database offline.
+    Restore-->>App: Restore
+    alt files copied back
+        App->>App: copy the stored files back
+        App->>Restore: finish()
+        Restore->>VSS: SetFileRestoreStatus(all), PostRestore
+        VSS->>W: post-restore
+        Note over W: SQL Server brings the database online
+    else nothing copied, or copy failed
+        App->>Restore: abort() or drop
+        Restore->>VSS: SetFileRestoreStatus(failed), PostRestore
+        VSS->>W: post-restore
+        Note over W: Before any copy, the database is as it was
+    end
+    Restore-->>App: writer statuses, or Err
 ```
 
 `begin`: `InitializeForRestore` from the document, `GatherWriterMetadata`, then for each

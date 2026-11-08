@@ -1,13 +1,14 @@
-//! The VSS requester interface, `IVssBackupComponents`, behind a safe wrapper.
+//! VSS's requester interface, `IVssBackupComponents`, behind a safe wrapper.
 //!
-//! The `windows` crate has most of what VSS needs, including `IVssAsync` and
-//! `VSS_SNAPSHOT_PROP`, but not `IVssBackupComponents` or the function that creates it.
-//! Those are declared in [`raw`], in the order of `vsbackup.h` in the Windows SDK, which the
-//! slot tests at the end check.
+//! The `windows` crate has most of what VSS needs, including `IVssAsync`, `IVssComponent`,
+//! `IVssWMFiledesc` and `VSS_SNAPSHOT_PROP`. What it lacks is declared in [`raw`].
 //!
 //! A [`Backup`] must be used and dropped on the thread that made it, inside an
 //! [`Apartment`](super::com::Apartment). It isn't `Send`, so the compiler holds callers to
 //! that.
+
+mod metadata;
+mod raw;
 
 use std::sync::OnceLock;
 use std::thread;
@@ -17,11 +18,13 @@ use windows::core::{s, w, Error as WinError, Result as WinResult, BOOL, BSTR, GU
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Storage::Vss::{
     IVssAsync, VSS_BT_COPY, VSS_CTX_BACKUP, VSS_CTX_FILE_SHARE_BACKUP, VSS_OBJECT_SNAPSHOT_SET,
-    VSS_SNAPSHOT_PROP, VSS_S_ASYNC_CANCELLED, VSS_S_ASYNC_FINISHED,
+    VSS_RS_ALL, VSS_RS_FAILED, VSS_SNAPSHOT_PROP, VSS_S_ASYNC_CANCELLED, VSS_S_ASYNC_FINISHED,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
+
+pub(crate) use metadata::{find_component, GatheredWriter, Selected};
 
 use super::wide::to_wide;
 use crate::error::{Error, Result};
@@ -29,210 +32,6 @@ use crate::guid::Guid;
 use crate::hresult::HResult;
 use crate::options::Consistency;
 use crate::writer::WriterStatus;
-
-/// Declarations the `windows` crate doesn't have. Methods that aren't called are still
-/// declared, so that each one after them lands in its slot.
-pub(super) mod raw {
-    #![allow(non_snake_case, dead_code, clippy::too_many_arguments)]
-
-    use std::ffi::c_void;
-
-    use windows::core::PCWSTR;
-    use windows::core::{interface, IUnknown, IUnknown_Vtbl, Result, BOOL, BSTR, GUID, HRESULT};
-    use windows::Win32::Storage::Vss::{
-        IVssAsync, VSS_BACKUP_TYPE, VSS_FILE_RESTORE_STATUS, VSS_OBJECT_TYPE, VSS_SNAPSHOT_PROP,
-    };
-
-    /// `IVssBackupComponents`, from `vsbackup.h`, up to `GetSnapshotProperties`. Later
-    /// methods are never called, so they're left out.
-    #[interface("665c1d5f-c218-414d-a05d-7fef5f9d5c86")]
-    pub(in crate::sys) unsafe trait IVssBackupComponents: IUnknown {
-        pub(in crate::sys) fn GetWriterComponentsCount(&self, count: *mut u32) -> Result<()>;
-        pub(in crate::sys) fn GetWriterComponents(
-            &self,
-            index: u32,
-            components: *mut *mut c_void,
-        ) -> Result<()>;
-        pub(in crate::sys) fn InitializeForBackup(&self, xml: *const u16) -> Result<()>;
-        pub(in crate::sys) fn SetBackupState(
-            &self,
-            select_components: bool,
-            bootable_system_state: bool,
-            backup_type: VSS_BACKUP_TYPE,
-            partial_file_support: bool,
-        ) -> Result<()>;
-        pub(in crate::sys) fn InitializeForRestore(&self, xml: *const u16) -> Result<()>;
-        pub(in crate::sys) fn SetRestoreState(&self, restore_type: i32) -> Result<()>;
-        pub(in crate::sys) fn GatherWriterMetadata(
-            &self,
-            pending: *mut Option<IVssAsync>,
-        ) -> Result<()>;
-        pub(in crate::sys) fn GetWriterMetadataCount(&self, count: *mut u32) -> Result<()>;
-        pub(in crate::sys) fn GetWriterMetadata(
-            &self,
-            index: u32,
-            instance: *mut GUID,
-            metadata: *mut *mut c_void,
-        ) -> Result<()>;
-        pub(in crate::sys) fn FreeWriterMetadata(&self) -> Result<()>;
-        pub(in crate::sys) fn AddComponent(
-            &self,
-            instance: GUID,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn PrepareForBackup(
-            &self,
-            pending: *mut Option<IVssAsync>,
-        ) -> Result<()>;
-        pub(in crate::sys) fn AbortBackup(&self) -> Result<()>;
-        pub(in crate::sys) fn GatherWriterStatus(
-            &self,
-            pending: *mut Option<IVssAsync>,
-        ) -> Result<()>;
-        pub(in crate::sys) fn GetWriterStatusCount(&self, count: *mut u32) -> Result<()>;
-        pub(in crate::sys) fn FreeWriterStatus(&self) -> Result<()>;
-        pub(in crate::sys) fn GetWriterStatus(
-            &self,
-            index: u32,
-            instance: *mut GUID,
-            writer: *mut GUID,
-            name: *mut BSTR,
-            state: *mut i32,
-            failure: *mut HRESULT,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetBackupSucceeded(
-            &self,
-            instance: GUID,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            succeeded: bool,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetBackupOptions(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            options: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetSelectedForRestore(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            selected: bool,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetRestoreOptions(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            options: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetAdditionalRestores(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            additional: bool,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetPreviousBackupStamp(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            stamp: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SaveAsXML(&self, xml: *mut BSTR) -> Result<()>;
-        pub(in crate::sys) fn BackupComplete(&self, pending: *mut Option<IVssAsync>) -> Result<()>;
-        pub(in crate::sys) fn AddAlternativeLocationMapping(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            path: PCWSTR,
-            filespec: PCWSTR,
-            recursive: bool,
-            destination: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn AddRestoreSubcomponent(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            sub_logical_path: PCWSTR,
-            sub_name: PCWSTR,
-            repair: bool,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetFileRestoreStatus(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            status: VSS_FILE_RESTORE_STATUS,
-        ) -> Result<()>;
-        pub(in crate::sys) fn AddNewTarget(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            path: PCWSTR,
-            file_name: PCWSTR,
-            recursive: bool,
-            alternate_path: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn SetRangesFilePath(
-            &self,
-            writer: GUID,
-            kind: i32,
-            logical_path: PCWSTR,
-            name: PCWSTR,
-            partial_file_index: u32,
-            ranges_file: PCWSTR,
-        ) -> Result<()>;
-        pub(in crate::sys) fn PreRestore(&self, pending: *mut Option<IVssAsync>) -> Result<()>;
-        pub(in crate::sys) fn PostRestore(&self, pending: *mut Option<IVssAsync>) -> Result<()>;
-        pub(in crate::sys) fn SetContext(&self, context: i32) -> Result<()>;
-        pub(in crate::sys) fn StartSnapshotSet(&self, set: *mut GUID) -> Result<()>;
-        pub(in crate::sys) fn AddToSnapshotSet(
-            &self,
-            volume: PCWSTR,
-            provider: GUID,
-            snapshot: *mut GUID,
-        ) -> Result<()>;
-        pub(in crate::sys) fn DoSnapshotSet(&self, pending: *mut Option<IVssAsync>) -> Result<()>;
-        pub(in crate::sys) fn DeleteSnapshots(
-            &self,
-            source: GUID,
-            source_type: VSS_OBJECT_TYPE,
-            force: BOOL,
-            deleted: *mut i32,
-            not_deleted: *mut GUID,
-        ) -> Result<()>;
-        pub(in crate::sys) fn ImportSnapshots(&self, pending: *mut Option<IVssAsync>)
-            -> Result<()>;
-        pub(in crate::sys) fn BreakSnapshotSet(&self, set: GUID) -> Result<()>;
-        pub(in crate::sys) fn GetSnapshotProperties(
-            &self,
-            snapshot: GUID,
-            properties: *mut VSS_SNAPSHOT_PROP,
-        ) -> Result<()>;
-    }
-}
-
 use raw::IVssBackupComponents;
 
 type CreateBackupComponents =
@@ -289,6 +88,19 @@ pub(crate) fn to_guid(id: GUID) -> Guid {
     Guid::from_u128(id.to_u128())
 }
 
+/// The nul-terminated UTF-16 string at `text`, or an empty string for null.
+///
+/// # Safety
+///
+/// `text` must be null or point to a nul-terminated UTF-16 string.
+unsafe fn string_at(text: *const u16) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    // SAFETY: the caller guarantees a nul-terminated string.
+    String::from_utf16_lossy(unsafe { PCWSTR(text).as_wide() })
+}
+
 /// What this crate needs from a snapshot's properties.
 pub(crate) struct SnapshotProperties {
     /// Such as `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy7`.
@@ -318,6 +130,8 @@ impl Backup {
         Ok(Backup { raw, timeout })
     }
 
+    // Setting up.
+
     pub(crate) fn initialize_for_backup(&self) -> Result<()> {
         // SAFETY: a null document starts a new backup.
         unsafe { self.raw.InitializeForBackup(std::ptr::null()) }
@@ -346,6 +160,8 @@ impl Backup {
         .map_err(failed("SetBackupState"))
     }
 
+    // Writer metadata.
+
     pub(crate) fn gather_writer_metadata(&self) -> Result<()> {
         // SAFETY: `pending` is a valid out-pointer for the call.
         self.run("GatherWriterMetadata", |pending| unsafe {
@@ -353,11 +169,47 @@ impl Backup {
         })
     }
 
+    /// Reads what `gather_writer_metadata` collected. Every metadata object is released
+    /// before this returns, as `free_writer_metadata` requires.
+    pub(crate) fn gathered_writers(&self) -> Result<Vec<GatheredWriter>> {
+        let mut count = 0;
+        // SAFETY: `count` outlives the call.
+        unsafe { self.raw.GetWriterMetadataCount(&mut count) }
+            .map_err(failed("GetWriterMetadataCount"))?;
+        (0..count)
+            .map(|index| {
+                let mut instance = GUID::zeroed();
+                // SAFETY: `instance` and `metadata` outlive the call, and `index` is in range.
+                let metadata = metadata::take("GetWriterMetadata", |metadata| unsafe {
+                    self.raw.GetWriterMetadata(index, &mut instance, metadata)
+                })?;
+                metadata::read_writer(&metadata)
+            })
+            .collect()
+    }
+
     /// Call once everything gathered by `gather_writer_metadata` has been released.
     pub(crate) fn free_writer_metadata(&self) -> Result<()> {
         // SAFETY: no arguments.
         unsafe { self.raw.FreeWriterMetadata() }.map_err(failed("FreeWriterMetadata"))
     }
+
+    /// Adds a component to a backup.
+    pub(crate) fn add_component(&self, component: &Selected) -> Result<()> {
+        // SAFETY: the strings live in `component`, which outlives the call.
+        unsafe {
+            self.raw.AddComponent(
+                component.instance,
+                component.writer,
+                component.kind,
+                component.logical_path(),
+                component.name(),
+            )
+        }
+        .map_err(failed("AddComponent"))
+    }
+
+    // Taking snapshots.
 
     pub(crate) fn start_snapshot_set(&self) -> Result<GUID> {
         let mut set = GUID::zeroed();
@@ -393,6 +245,22 @@ impl Backup {
         self.run("DoSnapshotSet", |pending| unsafe {
             self.raw.DoSnapshotSet(pending)
         })
+    }
+
+    pub(crate) fn snapshot_properties(&self, snapshot: GUID) -> Result<SnapshotProperties> {
+        let api = api()?;
+        // SAFETY: `VSS_SNAPSHOT_PROP` is plain data, for which all zeroes is a valid value.
+        let mut properties: VSS_SNAPSHOT_PROP = unsafe { std::mem::zeroed() };
+        // SAFETY: `properties` outlives the call.
+        unsafe { self.raw.GetSnapshotProperties(snapshot, &mut properties) }
+            .map_err(failed("GetSnapshotProperties"))?;
+        // SAFETY: on success VSS filled in the strings, each nul-terminated or null.
+        let device = unsafe { string_at(properties.m_pwszSnapshotDeviceObject) };
+        let created = properties.m_tsCreationTimestamp;
+        // SAFETY: frees what `GetSnapshotProperties` allocated, once. Nothing read from it is
+        // used afterwards.
+        unsafe { (api.free_snapshot_properties)(&mut properties) };
+        Ok(SnapshotProperties { device, created })
     }
 
     /// What every writer reports now.
@@ -442,22 +310,6 @@ impl Backup {
             .collect()
     }
 
-    pub(crate) fn snapshot_properties(&self, snapshot: GUID) -> Result<SnapshotProperties> {
-        let api = api()?;
-        // SAFETY: `VSS_SNAPSHOT_PROP` is plain data, for which all zeroes is a valid value.
-        let mut properties: VSS_SNAPSHOT_PROP = unsafe { std::mem::zeroed() };
-        // SAFETY: `properties` outlives the call.
-        unsafe { self.raw.GetSnapshotProperties(snapshot, &mut properties) }
-            .map_err(failed("GetSnapshotProperties"))?;
-        // SAFETY: on success VSS filled in the strings, each nul-terminated or null.
-        let device = unsafe { string_at(properties.m_pwszSnapshotDeviceObject) };
-        let created = properties.m_tsCreationTimestamp;
-        // SAFETY: frees what `GetSnapshotProperties` allocated, once. Nothing read from it is
-        // used afterwards.
-        unsafe { (api.free_snapshot_properties)(&mut properties) };
-        Ok(SnapshotProperties { device, created })
-    }
-
     /// Cancels the backup after a failure. Releasing the session afterwards removes any
     /// snapshot it made. A failure here can't be acted on, so it's ignored.
     pub(crate) fn abort_backup(&self) {
@@ -465,11 +317,36 @@ impl Backup {
         let _ = unsafe { self.raw.AbortBackup() };
     }
 
+    // Ending a backup.
+
+    pub(crate) fn set_backup_succeeded(&self, component: &Selected) -> Result<()> {
+        // SAFETY: the strings live in `component`, which outlives the call.
+        unsafe {
+            self.raw.SetBackupSucceeded(
+                component.instance,
+                component.writer,
+                component.kind,
+                component.logical_path(),
+                component.name(),
+                true,
+            )
+        }
+        .map_err(failed("SetBackupSucceeded"))
+    }
+
     pub(crate) fn backup_complete(&self) -> Result<()> {
         // SAFETY: `pending` is a valid out-pointer for the call.
         self.run("BackupComplete", |pending| unsafe {
             self.raw.BackupComplete(pending)
         })
+    }
+
+    /// The backup components document, which a restore needs.
+    pub(crate) fn save_as_xml(&self) -> Result<String> {
+        let mut xml = BSTR::new();
+        // SAFETY: `xml` outlives the call, and frees the string it receives.
+        unsafe { self.raw.SaveAsXML(&mut xml) }.map_err(failed("SaveAsXML"))?;
+        Ok(xml.to_string())
     }
 
     pub(crate) fn delete_snapshot_set(&self, set: GUID) -> Result<()> {
@@ -487,17 +364,105 @@ impl Backup {
         .map_err(failed("DeleteSnapshots"))
     }
 
+    // Restoring.
+
+    pub(crate) fn initialize_for_restore(&self, document: &str) -> Result<()> {
+        let xml = BSTR::from(document).into_raw();
+        // SAFETY: `xml` is a BSTR that lives until it's freed below, after the call.
+        let result = unsafe { self.raw.InitializeForRestore(xml) };
+        // SAFETY: takes back the BSTR made above, which frees it once.
+        drop(unsafe { BSTR::from_raw(xml) });
+        result.map_err(failed("InitializeForRestore"))
+    }
+
+    /// The components the document records as backed up successfully. Writers may no longer
+    /// list them, as what they backed up may be gone by now.
+    pub(crate) fn document_components(&self) -> Result<Vec<Selected>> {
+        let mut count = 0;
+        // SAFETY: `count` outlives the call.
+        unsafe { self.raw.GetWriterComponentsCount(&mut count) }
+            .map_err(failed("GetWriterComponentsCount"))?;
+        let mut found = Vec::new();
+        for index in 0..count {
+            let mut components = std::ptr::null_mut();
+            // SAFETY: `components` outlives the call, and `index` is in range. The reference
+            // it receives is handed straight to `read_document_writer`, which releases it.
+            unsafe { self.raw.GetWriterComponents(index, &mut components) }
+                .map_err(failed("GetWriterComponents"))?;
+            found.extend(metadata::read_document_writer(components)?);
+        }
+        Ok(found)
+    }
+
+    /// Selects a component for restore, and says no restores of it will follow, so its
+    /// writer finishes recovery. For SQL Server, that brings the database online.
+    pub(crate) fn select_for_restore(&self, component: &Selected) -> Result<()> {
+        // SAFETY: the strings live in `component`, which outlives both calls.
+        unsafe {
+            self.raw.SetSelectedForRestore(
+                component.writer,
+                component.kind,
+                component.logical_path(),
+                component.name(),
+                true,
+            )
+        }
+        .map_err(failed("SetSelectedForRestore"))?;
+        // SAFETY: as above.
+        unsafe {
+            self.raw.SetAdditionalRestores(
+                component.writer,
+                component.kind,
+                component.logical_path(),
+                component.name(),
+                false,
+            )
+        }
+        .map_err(failed("SetAdditionalRestores"))
+    }
+
+    pub(crate) fn pre_restore(&self) -> Result<()> {
+        // SAFETY: `pending` is a valid out-pointer for the call.
+        self.run("PreRestore", |pending| unsafe {
+            self.raw.PreRestore(pending)
+        })
+    }
+
+    pub(crate) fn set_file_restore_status(
+        &self,
+        component: &Selected,
+        restored: bool,
+    ) -> Result<()> {
+        let status = if restored { VSS_RS_ALL } else { VSS_RS_FAILED };
+        // SAFETY: the strings live in `component`, which outlives the call.
+        unsafe {
+            self.raw.SetFileRestoreStatus(
+                component.writer,
+                component.kind,
+                component.logical_path(),
+                component.name(),
+                status,
+            )
+        }
+        .map_err(failed("SetFileRestoreStatus"))
+    }
+
+    pub(crate) fn post_restore(&self) -> Result<()> {
+        // SAFETY: `pending` is a valid out-pointer for the call.
+        self.run("PostRestore", |pending| unsafe {
+            self.raw.PostRestore(pending)
+        })
+    }
+
+    // Waiting.
+
     /// Starts an asynchronous step and waits for it.
     fn run(
         &self,
         operation: &'static str,
         start: impl FnOnce(*mut Option<IVssAsync>) -> WinResult<()>,
     ) -> Result<()> {
-        let mut pending = None;
-        start(&mut pending).map_err(failed(operation))?;
-        let pending = pending.ok_or(Error::Internal {
-            reason: "VSS started a step without a way to wait for it",
-        })?;
+        let pending = metadata::take(operation, start)?;
         self.wait(operation, &pending)
     }
 
@@ -544,91 +509,9 @@ impl Backup {
     }
 }
 
-/// The nul-terminated UTF-16 string at `text`, or an empty string for null.
-///
-/// # Safety
-///
-/// `text` must be null or point to a nul-terminated UTF-16 string.
-unsafe fn string_at(text: *const u16) -> String {
-    if text.is_null() {
-        return String::new();
-    }
-    // SAFETY: the caller guarantees a nul-terminated string.
-    String::from_utf16_lossy(unsafe { PCWSTR(text).as_wide() })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::raw::IVssBackupComponents_Vtbl as Vtbl;
     use super::*;
-    use std::mem::{offset_of, size_of};
-
-    fn slot(offset: usize) -> usize {
-        offset / size_of::<usize>()
-    }
-
-    /// A method in the wrong slot calls a different method, and nothing would catch that
-    /// before a real snapshot crashed. These are the positions in `vsbackup.h`.
-    #[test]
-    fn methods_are_in_their_vtable_slots() {
-        let slots = [
-            (offset_of!(Vtbl, GetWriterComponentsCount), 3),
-            (offset_of!(Vtbl, GetWriterComponents), 4),
-            (offset_of!(Vtbl, InitializeForBackup), 5),
-            (offset_of!(Vtbl, SetBackupState), 6),
-            (offset_of!(Vtbl, InitializeForRestore), 7),
-            (offset_of!(Vtbl, SetRestoreState), 8),
-            (offset_of!(Vtbl, GatherWriterMetadata), 9),
-            (offset_of!(Vtbl, GetWriterMetadataCount), 10),
-            (offset_of!(Vtbl, GetWriterMetadata), 11),
-            (offset_of!(Vtbl, FreeWriterMetadata), 12),
-            (offset_of!(Vtbl, AddComponent), 13),
-            (offset_of!(Vtbl, PrepareForBackup), 14),
-            (offset_of!(Vtbl, AbortBackup), 15),
-            (offset_of!(Vtbl, GatherWriterStatus), 16),
-            (offset_of!(Vtbl, GetWriterStatusCount), 17),
-            (offset_of!(Vtbl, FreeWriterStatus), 18),
-            (offset_of!(Vtbl, GetWriterStatus), 19),
-            (offset_of!(Vtbl, SetBackupSucceeded), 20),
-            (offset_of!(Vtbl, SetBackupOptions), 21),
-            (offset_of!(Vtbl, SetSelectedForRestore), 22),
-            (offset_of!(Vtbl, SetRestoreOptions), 23),
-            (offset_of!(Vtbl, SetAdditionalRestores), 24),
-            (offset_of!(Vtbl, SetPreviousBackupStamp), 25),
-            (offset_of!(Vtbl, SaveAsXML), 26),
-            (offset_of!(Vtbl, BackupComplete), 27),
-            (offset_of!(Vtbl, AddAlternativeLocationMapping), 28),
-            (offset_of!(Vtbl, AddRestoreSubcomponent), 29),
-            (offset_of!(Vtbl, SetFileRestoreStatus), 30),
-            (offset_of!(Vtbl, AddNewTarget), 31),
-            (offset_of!(Vtbl, SetRangesFilePath), 32),
-            (offset_of!(Vtbl, PreRestore), 33),
-            (offset_of!(Vtbl, PostRestore), 34),
-            (offset_of!(Vtbl, SetContext), 35),
-            (offset_of!(Vtbl, StartSnapshotSet), 36),
-            (offset_of!(Vtbl, AddToSnapshotSet), 37),
-            (offset_of!(Vtbl, DoSnapshotSet), 38),
-            (offset_of!(Vtbl, DeleteSnapshots), 39),
-            (offset_of!(Vtbl, ImportSnapshots), 40),
-            (offset_of!(Vtbl, BreakSnapshotSet), 41),
-            (offset_of!(Vtbl, GetSnapshotProperties), 42),
-        ];
-        for (index, (offset, expected)) in slots.into_iter().enumerate() {
-            assert_eq!(slot(offset), expected, "entry {index}");
-        }
-        assert_eq!(size_of::<Vtbl>(), 43 * size_of::<usize>());
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn snapshot_properties_match_the_c_layout() {
-        assert_eq!(
-            offset_of!(VSS_SNAPSHOT_PROP, m_pwszSnapshotDeviceObject),
-            40
-        );
-        assert_eq!(offset_of!(VSS_SNAPSHOT_PROP, m_tsCreationTimestamp), 112);
-        assert_eq!(size_of::<VSS_SNAPSHOT_PROP>(), 128);
-    }
 
     #[test]
     fn reads_a_string_or_null() {

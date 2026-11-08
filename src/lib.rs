@@ -48,15 +48,13 @@
         clippy::unimplemented
     )
 )]
-// Some internal helpers are for listing writers and restoring, which come next. Remove
-// this then.
-#![allow(dead_code)]
 
 mod document;
 mod error;
 mod guid;
 mod hresult;
 mod options;
+mod restore;
 mod snapshot;
 #[allow(unsafe_code)]
 mod sys;
@@ -68,9 +66,10 @@ pub use error::{Error, Result};
 pub use guid::{Guid, ParseGuidError};
 pub use hresult::HResult;
 pub use options::{Consistency, RestoreOptions, SnapshotOptions};
+pub use restore::Restore;
 pub use snapshot::SnapshotSet;
 pub use volume::VolumeSnapshot;
 pub use writer::{
-    Component, ComponentId, ComponentKind, FileSpec, RestoreMethod, WriterInfo, WriterState,
-    WriterStatus,
+    list_writers, Component, ComponentId, ComponentKind, FileSpec, RestoreMethod, WriterInfo,
+    WriterState, WriterStatus,
 };

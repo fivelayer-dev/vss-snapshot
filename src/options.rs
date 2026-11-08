@@ -20,7 +20,7 @@ pub enum Consistency {
     Crash,
 }
 
-/// How to create a `SnapshotSet`.
+/// How to create a [`SnapshotSet`](crate::SnapshotSet).
 ///
 /// Every snapshot is a VSS *copy* backup, which tells writers not to treat it as a backup of
 /// record. A database won't truncate its logs because of one, so it never disturbs another
@@ -69,7 +69,7 @@ impl SnapshotOptions {
 
     /// Sets the writer components to back up, replacing any set before, so that the backup
     /// can be restored through the writer. Finish such a backup with
-    /// `SnapshotSet::complete`.
+    /// [`SnapshotSet::complete`](crate::SnapshotSet::complete).
     ///
     /// This needs [`Consistency::Application`], and every volume holding the components'
     /// files, which [`Component::volumes`](crate::Component::volumes) lists. Without
@@ -120,7 +120,7 @@ impl Default for SnapshotOptions {
     }
 }
 
-/// How to run a `Restore`.
+/// How to run a [`Restore`](crate::Restore).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreOptions {
     timeout: Duration,

@@ -14,7 +14,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use vss_snapshot::{Consistency, SnapshotOptions, SnapshotSet};
+use vss_snapshot::{
+    list_writers, ComponentId, Consistency, Error, Guid, SnapshotOptions, SnapshotSet,
+};
 
 /// The tests take turns, so each one's checks see only its own snapshots.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -361,4 +363,62 @@ fn sets_created_at_once_from_two_threads_both_succeed() {
     assert_ne!(one.id(), two.id());
     one.close().unwrap();
     two.close().unwrap();
+}
+
+#[test]
+fn lists_writers_and_what_they_look_after() {
+    let Some(_live) = live("lists_writers_and_what_they_look_after") else {
+        return;
+    };
+    let writers = list_writers(Duration::from_secs(120)).unwrap();
+    assert!(!writers.is_empty(), "no writers listed");
+    for writer in &writers {
+        eprintln!(
+            "{} {} {} components={}",
+            writer.id,
+            writer.name,
+            writer.restore_method,
+            writer.components.len()
+        );
+        assert!(!writer.name.is_empty());
+    }
+    // Some components list paths that don't resolve on a runner, so look for one that does.
+    let (writer, component, volumes) = writers
+        .iter()
+        .flat_map(|w| w.components.iter().map(move |c| (w, c)))
+        .find_map(|(w, c)| match c.volumes() {
+            Ok(volumes) if !volumes.is_empty() => Some((w, c, volumes)),
+            _ => None,
+        })
+        .expect("some component's files should be on a volume");
+    eprintln!("{component:?} on {volumes:?}");
+    let id = writer.component_id(component);
+    assert_eq!(id.writer_id, writer.id);
+    assert_eq!(id.name, component.name);
+    assert_eq!(id.logical_path, component.logical_path);
+}
+
+#[test]
+fn a_component_that_is_not_there_is_not_found() {
+    let Some(live) = live("a_component_that_is_not_there_is_not_found") else {
+        return;
+    };
+    let missing = ComponentId::new(Guid::from_u128(0x1234), "", "no such component");
+    let options = SnapshotOptions::new().with_components([missing.clone()]);
+    match SnapshotSet::create([&live.first], &options) {
+        Err(Error::ComponentNotFound { component }) => assert_eq!(component, missing),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn completing_without_components_is_refused_but_still_removes_the_snapshot() {
+    let Some(live) =
+        live("completing_without_components_is_refused_but_still_removes_the_snapshot")
+    else {
+        return;
+    };
+    check_removed(&crash(), &live.first, |s| {
+        assert!(matches!(s.complete(), Err(Error::InvalidOptions { .. })));
+    });
 }

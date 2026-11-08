@@ -1,8 +1,9 @@
 /// The backup components document VSS produces when a backup of selected components
-/// completes, from `SnapshotSet::complete`.
+/// completes, from [`SnapshotSet::complete`](crate::SnapshotSet::complete).
 ///
-/// Store it with the backup. A restore through the writer, with `Restore::begin`, can't
-/// happen without it. It's XML text, and this crate doesn't look inside it.
+/// Store it with the backup. A restore through the writer, with
+/// [`Restore::begin`](crate::Restore::begin), can't happen without it. It's XML text, and
+/// this crate doesn't look inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupDocument {
     xml: String,
