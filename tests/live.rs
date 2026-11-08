@@ -2,14 +2,16 @@
 //!
 //! They run only on GitHub Actions, where each run gets a disposable, elevated machine. The
 //! workflow makes two small test volumes and names them in `VSS_SNAPSHOT_TEST_VOLUMES`, such
-//! as `V:,W:`, with the second also mounted on a folder of the first, `V:\mnt\w`. Everywhere
-//! else each test prints `SKIPPED` and passes, even when elevated.
+//! as `V:,W:`, with the second also mounted on a folder of the first, `V:\mnt\w`. It also makes
+//! a ReFS volume, named in `VSS_SNAPSHOT_TEST_REFS_VOLUME`. Everywhere else each test prints
+//! `SKIPPED` and passes, even when elevated.
 #![cfg(windows)]
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -149,7 +151,55 @@ fn reads_a_file_that_is_locked_on_the_live_volume() {
     let Some(live) = live("reads_a_file_that_is_locked_on_the_live_volume") else {
         return;
     };
-    let dir = TestDir::new(&live.first, "locked");
+    check_reads_a_locked_file(&live.first, "locked");
+}
+
+/// The ReFS test volume, after checking that's what it really is, as a test on the wrong file
+/// system would prove nothing.
+fn refs_volume() -> String {
+    let volume = std::env::var("VSS_SNAPSHOT_TEST_REFS_VOLUME")
+        .expect("the workflow should set VSS_SNAPSHOT_TEST_REFS_VOLUME");
+    let output = Command::new("fsutil")
+        .args(["fsinfo", "volumeinfo", &format!(r"{volume}\")])
+        .output()
+        .expect("fsutil should be on the PATH");
+    let info = String::from_utf8_lossy(&output.stdout);
+    assert!(info.contains("ReFS"), "{volume} isn't ReFS:\n{info}");
+    volume
+}
+
+#[test]
+fn a_refs_snapshot_holds_files_as_they_were() {
+    let Some(_live) = live("a_refs_snapshot_holds_files_as_they_were") else {
+        return;
+    };
+    let volume = refs_volume();
+    check_holds_files_as_they_were(&crash(), &volume, "refs-crash");
+    check_holds_files_as_they_were(&SnapshotOptions::new(), &volume, "refs-application");
+}
+
+#[test]
+fn a_refs_snapshot_reads_a_file_that_is_locked() {
+    let Some(_live) = live("a_refs_snapshot_reads_a_file_that_is_locked") else {
+        return;
+    };
+    check_reads_a_locked_file(&refs_volume(), "refs-locked");
+}
+
+#[test]
+fn a_refs_snapshot_is_removed_by_closing_or_dropping() {
+    let Some(_live) = live("a_refs_snapshot_is_removed_by_closing_or_dropping") else {
+        return;
+    };
+    let volume = refs_volume();
+    check_removed(&crash(), &volume, |s| s.close().unwrap());
+    check_removed(&SnapshotOptions::new(), &volume, |s| s.close().unwrap());
+    check_removed(&crash(), &volume, drop);
+    check_removed(&SnapshotOptions::new(), &volume, drop);
+}
+
+fn check_reads_a_locked_file(volume: &str, test: &str) {
+    let dir = TestDir::new(volume, test);
     let path = dir.file("locked");
     let mut held = OpenOptions::new()
         .create(true)
@@ -162,7 +212,7 @@ fn reads_a_file_that_is_locked_on_the_live_volume() {
     held.sync_all().unwrap();
     assert!(fs::read(&path).is_err(), "the live file should be locked");
 
-    let snapshots = SnapshotSet::create([&live.first], &crash()).unwrap();
+    let snapshots = SnapshotSet::create([volume], &crash()).unwrap();
     let copy = fs::read(snapshots.path_in_snapshot(&path).unwrap()).unwrap();
     assert_eq!(copy, b"locked contents");
     drop(held);

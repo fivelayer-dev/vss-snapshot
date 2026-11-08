@@ -59,6 +59,7 @@ jobs:
       - name: Test
         env:
           VSS_SNAPSHOT_TEST_VOLUMES: "V:,W:"
+          VSS_SNAPSHOT_TEST_REFS_VOLUME: "R:"
         run: cargo test --all-features -- --nocapture
 
       # The tests check their own snapshots are removed, and this checks nothing else was left.
