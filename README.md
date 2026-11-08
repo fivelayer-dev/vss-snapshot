@@ -5,9 +5,10 @@
 Take temporary, read-only Windows Volume Shadow Copy (VSS) snapshots from Rust, so your program
 can read every file as it was at one moment, including files that are open or locked.
 
-> **Status:** under development. The interface is defined in
-> [docs/INTERFACE.md](docs/INTERFACE.md); the implementation is in progress. It isn't on
-> crates.io yet.
+> **Status:** under development. Taking, reading and removing snapshots is implemented, with
+> tests that take real snapshots on GitHub's Windows runners. Listing writers, selecting components and restoring through
+> writers are next. The interface is defined in [docs/INTERFACE.md](docs/INTERFACE.md). It
+> isn't on crates.io yet.
 
 - **Safe API.** All COM and VSS calls are private. Errors are typed, and the library doesn't
   panic.

@@ -1,4 +1,5 @@
 # Creates two small NTFS volumes on virtual disks, V: and W:, for the live snapshot tests.
+# W: is also mounted on the folder V:\mnt\w, to test volumes mounted on folders.
 # Snapshotting these takes seconds, where the runner's system drive would take much longer.
 # Each disk is expandable, so it only uses the space that's written to it.
 
@@ -19,4 +20,11 @@ foreach ($letter in 'V', 'W') {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-Get-Volume -DriveLetter V, W | Format-Table DriveLetter, FileSystem, Size, SizeRemaining
+$folder = 'V:\mnt\w'
+New-Item -ItemType Directory -Path $folder | Out-Null
+$guidPath = (Get-Volume -DriveLetter W).Path
+mountvol $folder $guidPath
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+Get-Volume -DriveLetter V, W | Format-Table DriveLetter, FileSystem, Size, SizeRemaining, Path
+mountvol | Select-String -Pattern 'V:\\mnt\\w' -Context 1, 0

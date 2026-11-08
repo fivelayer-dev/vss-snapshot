@@ -19,6 +19,7 @@ targets = ["x86_64-pc-windows-msvc"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Vss",
     "Win32_System_Com",
@@ -26,3 +27,6 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ] }
+# The `windows` crate lacks IVssBackupComponents, which is declared with this crate's
+# `interface` macro. The macro's output refers to `windows_core` by name.
+windows-core = "0.62"

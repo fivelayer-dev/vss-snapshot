@@ -5,8 +5,8 @@ errors, threading, the privileges it needs, what it guarantees about cleanup, an
 deliberately doesn't do. The rustdoc on each item is the detailed reference. Where they differ,
 this document states the intent and the rustdoc is a bug.
 
-**Status:** being implemented. The value types, errors and options exist; taking snapshots,
-listing writers and restoring don't yet.
+**Status:** being implemented. Snapshots work; selecting components, `complete`,
+`list_writers` and `Restore` don't exist yet.
 
 ## Contents
 
@@ -413,10 +413,75 @@ impl fmt::Display for HResult;
 
 ### A snapshot
 
-```text
-SnapshotSet::create ──► (read files through device_path / path_in_snapshot) ──► close
-                                                                              ├► complete  (components selected)
-                                                                              └► drop
+A snapshot set's life, including what happens when things go wrong:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Creating: create()
+    Creating --> [*]: error, nothing left behind
+    Creating --> Live: snapshots taken
+    Live --> Removed: close() or drop
+    Live --> Removed: complete(), components selected
+    Live --> Orphaned: process killed
+    Orphaned --> [*]: VSS removes it, after minutes
+    Removed --> [*]
+    note right of Live
+        Paths are readable.
+        The snapshot uses disk space
+        for every change on the volume.
+    end note
+```
+
+And what happens between your thread, the set's private thread, VSS and the writers. The
+writer steps happen only with `Consistency::Application`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box Your program
+        participant App as Your thread
+    end
+    box vss-snapshot
+        participant Set as SnapshotSet
+        participant Worker as Private thread
+    end
+    box Windows
+        participant VSS as VSS
+        participant W as Writers
+    end
+
+    App->>Set: create(volumes, options)
+    Note over Set: Check names and options,<br/>find each volume's GUID path
+    Set->>Worker: start
+    Note over Worker,W: Prepare
+    Worker->>VSS: InitializeForBackup, SetContext, SetBackupState (copy)
+    Worker->>VSS: GatherWriterMetadata
+    VSS->>W: identify
+    Worker->>VSS: StartSnapshotSet, AddToSnapshotSet for each volume
+    Worker->>VSS: PrepareForBackup
+    VSS->>W: prepare
+    Note over Worker,W: Snapshot
+    Worker->>VSS: DoSnapshotSet
+    VSS->>W: freeze: flush and hold writes
+    Note over VSS: snapshots taken
+    VSS->>W: thaw
+    Worker->>VSS: GatherWriterStatus, GetSnapshotProperties
+    break a step fails
+        Worker->>VSS: AbortBackup, which removes anything created
+        Set-->>App: Err
+    end
+    Worker-->>Set: volumes and writer statuses
+    Set-->>App: SnapshotSet
+    App->>App: read files through path_in_snapshot or device_path
+    App->>Set: close() or drop
+    Note over Worker,W: Clean up
+    Set->>Worker: end
+    Worker->>VSS: BackupComplete
+    VSS->>W: backup complete
+    Worker->>VSS: DeleteSnapshots
+    Worker-->>Set: result
+    Set-->>App: Ok or Err
 ```
 
 `create` blocks until the snapshots exist, then returns. Inside it, in order:

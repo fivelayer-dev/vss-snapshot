@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 use crate::guid::Guid;
 
-/// One volume's snapshot, part of a `SnapshotSet`.
+/// One volume's snapshot, part of a [`SnapshotSet`](crate::SnapshotSet).
 ///
 /// Its paths stay valid until the set is closed, completed or dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
