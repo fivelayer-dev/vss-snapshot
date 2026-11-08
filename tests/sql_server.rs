@@ -294,7 +294,11 @@ fn a_component_not_in_the_document_is_not_found() {
     let database = Database::create(&sql, "vssmissing", &sql.first, &sql.first);
     let (id, _, document) = database.back_up();
     let other = ComponentId::new(id.writer_id, id.logical_path.clone(), "not backed up");
-    match Restore::begin(&document, &[other.clone()], &RestoreOptions::new()) {
+    match Restore::begin(
+        &document,
+        std::slice::from_ref(&other),
+        &RestoreOptions::new(),
+    ) {
         Err(Error::ComponentNotFound { component }) => assert_eq!(component, other),
         result => panic!("{result:?}"),
     }
