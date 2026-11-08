@@ -48,6 +48,9 @@ jobs:
         env:
           VSS_SNAPSHOT_TEST_VOLUMES: "V:,W:"
           VSS_SNAPSHOT_TEST_SQL_INSTANCE: '.\SQLEXPRESS'
+          # The tests that kill a process take about 10 minutes, mostly waiting for Windows to
+          # notice, so only runs started by hand include them.
+          VSS_SNAPSHOT_TEST_CRASH: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: cargo test --test sql_server -- --nocapture
 
       - name: Check no snapshots were left behind

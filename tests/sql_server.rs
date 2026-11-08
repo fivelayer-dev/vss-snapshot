@@ -4,13 +4,19 @@
 //! Express, names its instance in `VSS_SNAPSHOT_TEST_SQL_INSTANCE`, and makes two test
 //! volumes, named in `VSS_SNAPSHOT_TEST_VOLUMES`, with a `sql` folder on each that SQL Server
 //! may write to. Everywhere else each test prints `SKIPPED` and passes.
+//!
+//! The tests named `crash_` kill a process partway through, then wait minutes for Windows to
+//! notice. They also need `VSS_SNAPSHOT_TEST_CRASH=1`, which only a manual run of that workflow
+//! sets.
 #![cfg(windows)]
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use vss_snapshot::{
     list_writers, BackupDocument, Component, ComponentId, Error, Guid, Restore, RestoreOptions,
@@ -330,4 +336,187 @@ fn a_component_not_in_the_document_is_not_found() {
         result => panic!("{result:?}"),
     }
     assert_eq!(sql.state(&database.name), "ONLINE");
+}
+
+/// How long a killed process's snapshot may linger. COM can take minutes to notice.
+const ORPHAN_LIMIT: Duration = Duration::from_secs(12 * 60);
+/// How long to watch a database after a killed restore, in case its writer notices.
+const RESTORE_WATCH: Duration = Duration::from_secs(120);
+
+fn crash(test: &str) -> Option<Sql> {
+    let sql = sql(test)?;
+    if std::env::var("VSS_SNAPSHOT_TEST_CRASH").as_deref() != Ok("1") {
+        eprintln!("SKIPPED {test}: only a manual workflow run sets VSS_SNAPSHOT_TEST_CRASH");
+        return None;
+    }
+    Some(sql)
+}
+
+/// Not a real test. The crash tests run this binary again with
+/// `VSS_SNAPSHOT_TEST_CRASH_CHILD` set, to get a process they can kill while it holds a
+/// snapshot or is partway through a restore.
+#[test]
+fn crash_child_helper() {
+    let Ok(mode) = std::env::var("VSS_SNAPSHOT_TEST_CRASH_CHILD") else {
+        return;
+    };
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_some(),
+        "real snapshots are only taken on GitHub Actions"
+    );
+    let env = |name: &str| std::env::var(name).unwrap();
+    let _held: Box<dyn std::any::Any> = match mode.as_str() {
+        "snapshot" => {
+            let options = SnapshotOptions::new().with_timeout(TIMEOUT);
+            let snapshots =
+                SnapshotSet::create([env("VSS_SNAPSHOT_TEST_CRASH_VOLUME")], &options).unwrap();
+            println!("READY {}", snapshots.volumes()[0].device_path().display());
+            Box::new(snapshots)
+        }
+        "restore" => {
+            let xml = fs::read_to_string(env("VSS_SNAPSHOT_TEST_CRASH_DOCUMENT")).unwrap();
+            let id = ComponentId::new(
+                env("VSS_SNAPSHOT_TEST_CRASH_WRITER").parse().unwrap(),
+                env("VSS_SNAPSHOT_TEST_CRASH_PATH"),
+                env("VSS_SNAPSHOT_TEST_CRASH_NAME"),
+            );
+            let options = RestoreOptions::new().with_timeout(TIMEOUT);
+            let restore = Restore::begin(&BackupDocument::from_xml(xml), &[id], &options).unwrap();
+            println!("READY begun");
+            Box::new(restore)
+        }
+        other => panic!("unknown mode {other}"),
+    };
+    std::io::stdout().flush().unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+/// A child process, killed when this is dropped.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts `crash_child_helper` and waits until it's ready. Returns the process to kill, and
+/// what it reported.
+fn start_child(mode: &str, envs: &[(&str, &str)]) -> (KillOnDrop, String) {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["crash_child_helper", "--exact", "--nocapture"])
+        .env("VSS_SNAPSHOT_TEST_CRASH_CHILD", mode)
+        .envs(envs.iter().copied())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let child = KillOnDrop(child);
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some((_, reported)) = line.split_once("READY ") {
+            return (child, reported.to_owned());
+        }
+    }
+    panic!("the child process stopped before it was ready");
+}
+
+#[test]
+fn crash_a_killed_processs_snapshot_is_removed_and_new_ones_still_work() {
+    let Some(sql) = crash("crash_a_killed_processs_snapshot_is_removed_and_new_ones_still_work")
+    else {
+        return;
+    };
+    let (child, device) = start_child(
+        "snapshot",
+        &[("VSS_SNAPSHOT_TEST_CRASH_VOLUME", sql.first.as_str())],
+    );
+    let device = PathBuf::from(device);
+    assert!(device.exists(), "the child's snapshot isn't there");
+
+    drop(child);
+    let killed = Instant::now();
+
+    let options = SnapshotOptions::new().with_timeout(TIMEOUT);
+    let snapshots = loop {
+        match SnapshotSet::create([&sql.first], &options) {
+            Ok(snapshots) => break snapshots,
+            Err(error) if error.is_retryable() && killed.elapsed() < ORPHAN_LIMIT => {
+                eprintln!("retrying after {:?}: {error}", killed.elapsed());
+                thread::sleep(Duration::from_secs(5));
+            }
+            Err(error) => panic!("a new snapshot failed after the kill: {error}"),
+        }
+    };
+    eprintln!(
+        "MEASURED new snapshot taken {:?} after the kill",
+        killed.elapsed()
+    );
+    assert_ne!(snapshots.volumes()[0].device_path(), device.as_path());
+    snapshots.close().unwrap();
+
+    while device.exists() {
+        assert!(
+            killed.elapsed() < ORPHAN_LIMIT,
+            "the snapshot outlived its process by {ORPHAN_LIMIT:?}"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+    eprintln!(
+        "MEASURED killed process's snapshot removed after {:?}",
+        killed.elapsed()
+    );
+}
+
+#[test]
+fn crash_a_restore_killed_partway_can_be_run_again() {
+    let Some(sql) = crash("crash_a_restore_killed_partway_can_be_run_again") else {
+        return;
+    };
+    let database = Database::create(&sql, "vsskilled", &sql.first, &sql.first);
+    let (id, component, document) = database.back_up();
+    let stored = database.backup.join("document.xml");
+    fs::write(&stored, document.as_xml()).unwrap();
+
+    let writer = id.writer_id.to_string();
+    let (child, _) = start_child(
+        "restore",
+        &[
+            ("VSS_SNAPSHOT_TEST_CRASH_DOCUMENT", stored.to_str().unwrap()),
+            ("VSS_SNAPSHOT_TEST_CRASH_WRITER", writer.as_str()),
+            ("VSS_SNAPSHOT_TEST_CRASH_PATH", id.logical_path.as_str()),
+            ("VSS_SNAPSHOT_TEST_CRASH_NAME", id.name.as_str()),
+        ],
+    );
+    assert_eq!(sql.state(&database.name), "RESTORING");
+
+    drop(child);
+    let killed = Instant::now();
+    while killed.elapsed() < RESTORE_WATCH {
+        assert_eq!(
+            sql.state(&database.name),
+            "RESTORING",
+            "changed {:?} after the kill",
+            killed.elapsed()
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+    eprintln!(
+        "MEASURED still RESTORING {:?} after the kill",
+        killed.elapsed()
+    );
+
+    let restore = Restore::begin(
+        &document,
+        std::slice::from_ref(&id),
+        &RestoreOptions::new().with_timeout(TIMEOUT),
+    )
+    .unwrap();
+    database.copy_back(&component);
+    restore.finish().unwrap();
+    assert_eq!(sql.state(&database.name), "ONLINE");
+    assert_eq!(sql.count(&database.name), ROWS);
 }
