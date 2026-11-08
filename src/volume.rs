@@ -76,8 +76,8 @@ impl VolumeSnapshot {
     /// The root of the snapshot, such as
     /// `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy7\`, always ending in a backslash.
     ///
-    /// Open files under it to read them as they were. It can also be opened as a volume, for
-    /// example to read its USN journal. It's valid until the snapshot set is removed.
+    /// Open files under it to read them as they were. It's valid until the snapshot set is
+    /// removed.
     pub fn device_path(&self) -> &Path {
         &self.device_path
     }

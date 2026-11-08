@@ -110,7 +110,7 @@ impl VolumeSnapshot {
     /// Every place the volume is mounted, such as `C:\` and `D:\data\`, when created.
     pub fn mount_points(&self) -> &[PathBuf];
     /// The snapshot's root, `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\`.
-    /// Valid until the set is removed. Open it to read files, or as a volume.
+    /// Valid until the set is removed. Open files under it to read them as they were.
     pub fn device_path(&self) -> &Path;
     /// When VSS created the snapshot.
     pub fn created(&self) -> SystemTime;
