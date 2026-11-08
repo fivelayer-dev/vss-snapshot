@@ -520,3 +520,308 @@ fn crash_a_restore_killed_partway_can_be_run_again() {
     assert_eq!(sql.state(&database.name), "ONLINE");
     assert_eq!(sql.count(&database.name), ROWS);
 }
+
+impl Sql {
+    /// Runs a query that returns one number.
+    fn number(&self, query: &str) -> u64 {
+        let output = self.query(&format!("SET NOCOUNT ON; {query}"));
+        output.trim().parse().unwrap()
+    }
+}
+
+/// A database backed up while another connection keeps writing to it. Every transaction
+/// writes two rows with a pause between them, so a batch with one row would mean the backup
+/// isn't transactionally consistent. A row with batch -1 is added after the backup.
+struct BusyBackup<'a> {
+    database: Database<'a>,
+    /// How many rows were committed before the snapshot.
+    committed: u64,
+    id: ComponentId,
+    component: Component,
+    document: BackupDocument,
+}
+
+impl<'a> BusyBackup<'a> {
+    fn create(sql: &'a Sql, name: &str, data: &str, log: &str) -> BusyBackup<'a> {
+        let database = Database::create(sql, name, data, log);
+        sql.query(&format!(
+            "CREATE TABLE [{name}].dbo.pairs (batch INT NOT NULL, side INT NOT NULL)"
+        ));
+        let write_pairs = format!(
+            "USE [{name}]; DECLARE @b INT = 0; WHILE 1 = 1 BEGIN SET @b += 1; BEGIN TRAN; \
+             INSERT dbo.pairs VALUES (@b, 1); WAITFOR DELAY '00:00:00.005'; \
+             INSERT dbo.pairs VALUES (@b, 2); COMMIT; END"
+        );
+        let writing = KillOnDrop(
+            Command::new("sqlcmd")
+                .args(["-S", &sql.instance, "-E", "-C", "-b", "-Q", &write_pairs])
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("sqlcmd should be on the PATH"),
+        );
+        let count = format!("SELECT COUNT(*) FROM [{name}].dbo.pairs WITH (READCOMMITTED)");
+        let started = Instant::now();
+        while sql.number(&count) < 200 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no rows written"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+        let committed = sql.number(&count);
+
+        let (id, component, document) = database.back_up();
+        drop(writing);
+        sql.query(&format!("INSERT [{name}].dbo.pairs VALUES (-1, 1)"));
+        BusyBackup {
+            database,
+            committed,
+            id,
+            component,
+            document,
+        }
+    }
+
+    fn begin_restore(&self) -> Restore {
+        Restore::begin(
+            &self.document,
+            std::slice::from_ref(&self.id),
+            &RestoreOptions::new().with_timeout(TIMEOUT),
+        )
+        .unwrap()
+    }
+
+    fn restore(&self) {
+        let restore = self.begin_restore();
+        eprintln!("during the restore: {}", self.state());
+        self.database.copy_back(&self.component);
+        let writers = restore.finish().unwrap();
+        assert!(writers.iter().all(|w| !w.is_failed()), "{writers:?}");
+    }
+
+    fn state(&self) -> String {
+        self.database.sql.state(&self.database.name)
+    }
+
+    /// Checks `database` is sound, and holds exactly what was committed at the snapshot.
+    /// `CHECKDB` reports corruption as an error, which fails `sqlcmd` because of `-b`.
+    fn check_contents(&self, database: &str) {
+        let sql = self.database.sql;
+        sql.query(&format!("DBCC CHECKDB ([{database}]) WITH NO_INFOMSGS"));
+        let rows = sql.number(&format!("SELECT COUNT(*) FROM [{database}].dbo.pairs"));
+        let torn = sql.number(&format!(
+            "SELECT COUNT(*) FROM (SELECT batch FROM [{database}].dbo.pairs \
+             GROUP BY batch HAVING COUNT(*) <> 2) AS torn"
+        ));
+        let later = sql.number(&format!(
+            "SELECT COUNT(*) FROM [{database}].dbo.pairs WHERE batch = -1"
+        ));
+        eprintln!(
+            "committed before the snapshot: {}, found: {rows}",
+            self.committed
+        );
+        assert!(
+            rows >= self.committed,
+            "lost rows: {rows} < {}",
+            self.committed
+        );
+        assert_eq!(torn, 0, "the database holds half of a transaction");
+        assert_eq!(later, 0, "a row from after the snapshot is there");
+        assert_eq!(sql.count(database), ROWS);
+    }
+
+    /// Checks the restored database is back as it was, working, and known to SQL Server.
+    fn check_restored(&self) {
+        let sql = self.database.sql;
+        let name = &self.database.name;
+        assert_eq!(self.state(), "ONLINE");
+        self.check_contents(name);
+        sql.query(&format!("INSERT [{name}].dbo.pairs VALUES (-2, 1)"));
+        let history = sql.number(&format!(
+            "SELECT COUNT(*) FROM msdb.dbo.restorehistory \
+             WHERE destination_database_name = '{name}'"
+        ));
+        assert!(history >= 1, "SQL Server didn't record a restore");
+    }
+}
+
+#[test]
+fn a_backup_taken_during_writes_is_consistent() {
+    let Some(sql) = sql("a_backup_taken_during_writes_is_consistent") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vssbusy", &sql.first, &sql.first);
+    assert!(
+        backup.document.as_xml().to_lowercase().contains("vssbusy"),
+        "the document doesn't name the database"
+    );
+
+    // Attach the stored files as a new database, leaving the original alone.
+    let attached = Database {
+        sql: &sql,
+        name: "vssattached".to_owned(),
+        backup: std::env::temp_dir()
+            .join("vss-snapshot-sql")
+            .join("vssattached"),
+    };
+    let mut targets = Vec::new();
+    for file in files(&backup.component) {
+        let name = file.file_name().unwrap().to_str().unwrap().to_owned();
+        let target = file.with_file_name(format!("vssattached_{name}"));
+        fs::copy(backup.database.backup.join(&name), &target).unwrap();
+        targets.push(target);
+    }
+    targets.sort_by_key(|file| !has_extension(std::slice::from_ref(file), "mdf"));
+    let targets = targets
+        .iter()
+        .map(|file| format!("(FILENAME = N'{}')", file.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.query(&format!(
+        "CREATE DATABASE [{}] ON {targets} FOR ATTACH",
+        attached.name
+    ));
+    backup.check_contents(&attached.name);
+
+    let recorded = sql.number(
+        "SELECT COUNT(*) FROM msdb.dbo.backupset WHERE database_name = 'vssbusy' \
+         AND is_snapshot = 1 AND is_copy_only = 1",
+    );
+    assert!(recorded >= 1, "SQL Server didn't record a copy-only backup");
+}
+
+#[test]
+fn a_restore_over_an_offline_database_rolls_it_back() {
+    let Some(sql) = sql("a_restore_over_an_offline_database_rolls_it_back") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vssoffline", &sql.first, &sql.first);
+    sql.query("ALTER DATABASE [vssoffline] SET OFFLINE WITH ROLLBACK IMMEDIATE");
+    backup.restore();
+    backup.check_restored();
+}
+
+#[test]
+fn a_restore_over_an_online_database_rolls_it_back() {
+    let Some(sql) = sql("a_restore_over_an_online_database_rolls_it_back") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vssonline", &sql.first, &sql.first);
+    backup.restore();
+    backup.check_restored();
+}
+
+#[test]
+fn a_restore_can_be_run_again_after_an_abort() {
+    let Some(sql) = sql("a_restore_can_be_run_again_after_an_abort") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vssretry", &sql.first, &sql.first);
+    backup.begin_restore().abort().unwrap();
+
+    // Nothing was copied, so the database should be untouched, with its newest row.
+    assert_eq!(backup.state(), "ONLINE");
+    sql.query("DBCC CHECKDB ([vssretry]) WITH NO_INFOMSGS");
+    assert_eq!(
+        sql.number("SELECT COUNT(*) FROM [vssretry].dbo.pairs WHERE batch = -1"),
+        1,
+        "the aborted restore changed the database"
+    );
+
+    backup.restore();
+    backup.check_restored();
+}
+
+#[test]
+fn a_restore_can_be_run_again_after_a_partial_copy() {
+    let Some(sql) = sql("a_restore_can_be_run_again_after_a_partial_copy") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vsspartcopy", &sql.first, &sql.first);
+
+    let attempt = backup.begin_restore();
+    let live = files(&backup.component).swap_remove(0);
+    fs::copy(
+        backup.database.backup.join(live.file_name().unwrap()),
+        &live,
+    )
+    .unwrap();
+    // The writer can't bring back a mix of files, and the caller must be told.
+    let aborted = attempt.abort();
+    eprintln!("aborting after a partial copy: {aborted:?}");
+    assert!(
+        matches!(aborted, Err(Error::WriterFailed { .. })),
+        "abort hid the damage: {aborted:?}"
+    );
+    eprintln!("after the abort: {}", backup.state());
+
+    backup.restore();
+    backup.check_restored();
+}
+
+#[test]
+fn a_database_on_two_volumes_backs_up_and_restores() {
+    let Some(sql) = sql("a_database_on_two_volumes_backs_up_and_restores") else {
+        return;
+    };
+    let backup = BusyBackup::create(&sql, "vsstwo", &sql.first, &sql.second);
+    let listed = files(&backup.component);
+    for volume in [&sql.first, &sql.second] {
+        assert!(
+            listed
+                .iter()
+                .any(|file| file.to_str().unwrap().starts_with(volume.as_str())),
+            "no file on {volume}: {listed:?}"
+        );
+    }
+    backup.database.drop_if_there();
+    backup.restore();
+    backup.check_restored();
+}
+
+/// Starts the service again even if the test fails, so other tests aren't affected.
+struct RestartSqlWriter;
+
+impl Drop for RestartSqlWriter {
+    fn drop(&mut self) {
+        let _ = Command::new("net").args(["start", "SQLWriter"]).output();
+    }
+}
+
+/// With the writer's service stopped, the caller must get a clear answer, not a backup that
+/// quietly leaves SQL Server out.
+#[test]
+fn a_stopped_writer_service_is_reported() {
+    let Some(sql) = sql("a_stopped_writer_service_is_reported") else {
+        return;
+    };
+    let database = Database::create(&sql, "vssstopped", &sql.first, &sql.first);
+    let (id, component) = database.component();
+
+    let stopped = Command::new("net")
+        .args(["stop", "SQLWriter"])
+        .output()
+        .expect("net should be on the PATH");
+    assert!(stopped.status.success(), "{stopped:?}");
+    let restart = RestartSqlWriter;
+
+    let writers = list_writers(TIMEOUT).unwrap();
+    assert!(
+        !writers.iter().any(|w| w.id == SQL_WRITER),
+        "the writer is still listed"
+    );
+    let options = SnapshotOptions::new()
+        .with_timeout(TIMEOUT)
+        .with_components([id.clone()]);
+    match SnapshotSet::create(component.volumes().unwrap(), &options) {
+        Err(Error::ComponentNotFound { component }) => assert_eq!(component, id),
+        other => panic!("{other:?}"),
+    }
+
+    drop(restart);
+    let writers = list_writers(TIMEOUT).unwrap();
+    assert!(
+        writers.iter().any(|w| w.id == SQL_WRITER),
+        "the writer didn't come back"
+    );
+}
