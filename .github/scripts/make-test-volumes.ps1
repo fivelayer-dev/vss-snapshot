@@ -1,4 +1,4 @@
-# Creates volumes on virtual disks for the live snapshot tests: two small NTFS volumes, V: and
+# Creates volumes on virtual disks for the live snapshot tests: two NTFS volumes, V: and
 # W:, and a ReFS volume, R:. W: is also mounted on the folder V:\mnt\w, to test volumes mounted
 # on folders. Snapshotting these takes seconds, where the runner's system drive would take much
 # longer. Each disk is expandable, so it only uses the space that's written to it.
@@ -6,7 +6,7 @@
 $ErrorActionPreference = 'Stop'
 
 $volumes = @(
-    @{ Letter = 'V'; FileSystem = 'ntfs'; MaximumMB = 1024 },
+    @{ Letter = 'V'; FileSystem = 'ntfs'; MaximumMB = 4096 },
     @{ Letter = 'W'; FileSystem = 'ntfs'; MaximumMB = 1024 },
     @{ Letter = 'R'; FileSystem = 'refs'; MaximumMB = 10240 }
 )

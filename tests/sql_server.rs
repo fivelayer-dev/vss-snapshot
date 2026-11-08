@@ -11,10 +11,11 @@
 #![cfg(windows)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -868,12 +869,62 @@ impl Sql {
     }
 }
 
+/// Keeps rewriting a large file on a volume without flushing it, until dropped. Windows has to
+/// flush that data while writers are frozen, which makes a freeze long enough to catch.
+struct DirtyWrites {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    path: PathBuf,
+}
+
+impl DirtyWrites {
+    /// The size of the file, in MiB. Too much would make VSS give up on the flush.
+    const SIZE: usize = 400;
+
+    fn start(volume: &str) -> DirtyWrites {
+        let path = PathBuf::from(format!(r"{volume}\sql\dirty-writes.bin"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = thread::spawn({
+            let (path, stop) = (path.clone(), Arc::clone(&stop));
+            move || {
+                let mut file = fs::File::create(path).unwrap();
+                let block = vec![0x5a_u8; 1 << 20];
+                while !stop.load(Ordering::Relaxed) {
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    for _ in 0..DirtyWrites::SIZE {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        file.write_all(&block).unwrap();
+                    }
+                }
+            }
+        });
+        DirtyWrites {
+            stop,
+            thread: Some(thread),
+            path,
+        }
+    }
+}
+
+impl Drop for DirtyWrites {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Starts backing up `database` in a child process, and kills it as soon as SQL Server reports
 /// the database frozen. Returns whether it was still frozen after the kill. If not, the kill
 /// came too late to show anything.
 fn kill_while_frozen(database: &Database<'_>) -> bool {
     let sql = database.sql;
     let name = database.name.as_str();
+    let _dirty = DirtyWrites::start(&sql.first);
     let (id, _) = database.component();
     let writer = id.writer_id.to_string();
     let mut child = spawn_child(
@@ -924,7 +975,10 @@ fn crash_writers_recover_when_a_process_is_killed_while_they_are_frozen() {
         let name = format!("vssfrozen{attempt}");
         let database = Database::create(&sql, &name, &sql.first, &sql.first);
         if !kill_while_frozen(&database) {
-            eprintln!("attempt {attempt}: {name} had already resumed, so trying again");
+            eprintln!(
+                "attempt {attempt}: {name} had already resumed, so trying again. Its log:\n{}",
+                sql.database_log(&name)
+            );
             continue;
         }
         let killed = Instant::now();
