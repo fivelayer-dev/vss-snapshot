@@ -80,8 +80,14 @@ impl SnapshotSet {
     /// `Consistency::Crash`.
     pub fn writers(&self) -> &[WriterStatus];
 
+    /// The snapshots that have been removed since they were taken, by Windows or by
+    /// another program. None while all is well. Reads through a removed snapshot's
+    /// paths fail like any other read, so this is how to tell why.
+    pub fn lost(&self) -> Result<Vec<&VolumeSnapshot>>;
+
     /// Removes the snapshots and reports any failure, which drop can't.
     /// If components were selected, their writers are told the backup failed.
+    /// A snapshot that has already been removed isn't a failure.
     pub fn close(self) -> Result<()>;
 
     /// Tells the writers of the selected components that the backup succeeded,
@@ -510,7 +516,11 @@ Any failure after step 4 begins calls `AbortBackup`, which removes whatever was 
 2. With writers: `BackupComplete`, whatever happened in step 1.
 3. For `complete` only, if steps 1 and 2 succeeded: `SaveAsXML` to make the `BackupDocument`.
    It's saved after `BackupComplete` so it includes what writers added then.
-4. `DeleteSnapshots` for the set, whatever happened before.
+4. `DeleteSnapshots` for the set, whatever happened before. A set with no snapshot left to
+   delete isn't a failure.
+
+While a set is open, `lost` calls `GetSnapshotProperties` for each of its snapshots, and names
+those VSS no longer knows.
 
 Each step is attempted even if an earlier one failed, and the first failure is returned.
 
@@ -667,6 +677,7 @@ Snapshots are always **non-persistent**: they belong to the process that made th
 | `close` or `complete` returns `Err` | Every cleanup step was still attempted. If `DeleteSnapshots` itself failed, the snapshot remains until the process exits, then VSS removes it. |
 | The `SnapshotSet` is dropped (including during a panic unwind) | Same as `close`, with the error discarded. Drop blocks until done, bounded by the timeout per step. |
 | `create` fails | Nothing. Anything created is aborted before it returns. |
+| Another program deletes a snapshot while its set is open | That snapshot's paths stop working, and `lost` names it. The set's other snapshots stay, and `close` removes them and returns `Ok`, as it does when none is left. |
 | The process exits, is killed, or calls `std::process::exit` | VSS removes the snapshot itself once it notices, which took about 6 minutes when tested on Windows Server with writers. A new snapshot of the same volume works straight away, while the old one is still there. Writers with selected components get no `BackupComplete`, so they don't record a backup. |
 | The process is killed while writers are frozen, during `create` | Writers resume by themselves. When tested with SQL Server Express on Windows Server, the database resumed in under a second and stayed intact, a new snapshot worked within seconds, and no snapshot was left behind. |
 | A `Restore` is dropped without `finish` | Writers are told the restore failed. |
@@ -679,7 +690,8 @@ to find and delete.
 
 - **A snapshot costs disk space while it exists.** Windows keeps the old version of anything that
   changes, by default on the same volume. If that space runs out, Windows may delete the snapshot
-  while it's being read, and reads start failing. Keep snapshots short-lived.
+  while it's being read, and reads start failing. Keep snapshots short-lived, and when a read
+  fails, ask `SnapshotSet::lost` whether the snapshot is still there.
 - **Folders that another volume is mounted on are empty** in a snapshot. Include both volumes;
   `SnapshotSet::path_in_snapshot` picks the right one by longest mount point. A volume mounted
   inside one that's in the set but not itself in the set isn't detected, and paths through it

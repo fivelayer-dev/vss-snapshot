@@ -58,11 +58,20 @@ pub struct SnapshotSet {
 /// The private thread that holds the set's COM objects.
 #[derive(Debug)]
 struct Worker {
-    end: Sender<Ending>,
+    requests: Sender<Request>,
     thread: JoinHandle<Result<Option<BackupDocument>>>,
 }
 
-/// How the set ends. If the sender is dropped without sending, it closes.
+/// What the set asks of its thread. If the sender is dropped without ending the set, it
+/// closes.
+#[derive(Debug)]
+enum Request {
+    /// Say which snapshots Windows has removed, by their ids.
+    Lost(Sender<Result<Vec<Guid>>>),
+    End(Ending),
+}
+
+/// How the set ends.
 #[derive(Debug)]
 enum Ending {
     /// The backup is stored: tell the selected components' writers it succeeded.
@@ -125,12 +134,12 @@ impl SnapshotSet {
 
         let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
         let (created_tx, created_rx) = channel();
-        let (end_tx, end_rx) = channel();
+        let (requests_tx, requests_rx) = channel();
         let has_components = !options.components().is_empty();
         let options = options.clone();
         let thread = thread::Builder::new()
             .name("vss-snapshot".to_owned())
-            .spawn(move || run(&targets, &options, &created_tx, &end_rx))?;
+            .spawn(move || run(&targets, &options, &created_tx, &requests_rx))?;
 
         match created_rx.recv() {
             Ok(Ok(created)) => Ok(SnapshotSet {
@@ -139,7 +148,7 @@ impl SnapshotSet {
                 writers: created.writers,
                 has_components,
                 worker: Some(Worker {
-                    end: end_tx,
+                    requests: requests_tx,
                     thread,
                 }),
             }),
@@ -199,12 +208,36 @@ impl SnapshotSet {
         &self.writers
     }
 
+    /// The snapshots that Windows has removed since they were taken, which is none while
+    /// all is well.
+    ///
+    /// Windows removes a snapshot by itself when the space for the volume's shadow copies
+    /// runs out, and another program can delete one. Paths inside a snapshot that's gone
+    /// stop working, and reading through them fails like any other read. So when a read
+    /// from a snapshot fails, this says whether the snapshot is why. The rest of the set is
+    /// unaffected, and the set is closed as usual.
+    pub fn lost(&self) -> Result<Vec<&VolumeSnapshot>> {
+        let stopped = || Error::Internal {
+            reason: "the snapshot thread stopped before the set was closed",
+        };
+        let worker = self.worker.as_ref().ok_or_else(stopped)?;
+        let (reply_tx, reply_rx) = channel();
+        worker
+            .requests
+            .send(Request::Lost(reply_tx))
+            .map_err(|_| stopped())?;
+        let lost = reply_rx.recv().map_err(|_| stopped())??;
+        let is_lost = |volume: &&VolumeSnapshot| lost.contains(&volume.id());
+        Ok(self.volumes.iter().filter(is_lost).collect())
+    }
+
     /// Removes the snapshots, and reports any failure, which dropping the set can't. Paths
     /// inside the snapshots stop working. If components were selected, their writers are
     /// told the backup didn't succeed.
     ///
     /// Every cleanup step is attempted even if an earlier one fails. If removing the
-    /// snapshots itself fails, VSS removes them when the process exits.
+    /// snapshots itself fails, VSS removes them when the process exits. A snapshot that
+    /// Windows has already removed isn't a failure.
     pub fn close(mut self) -> Result<()> {
         self.end(Ending::Close).map(|_| ())
     }
@@ -232,7 +265,7 @@ impl SnapshotSet {
         let Some(worker) = self.worker.take() else {
             return Ok(None);
         };
-        let _ = worker.end.send(ending);
+        let _ = worker.requests.send(Request::End(ending));
         worker.thread.join().unwrap_or(Err(Error::Internal {
             reason: "the snapshot thread panicked",
         }))
@@ -271,13 +304,13 @@ fn resolve(names: Vec<(String, String)>) -> Result<Vec<Target>> {
     Ok(targets)
 }
 
-/// The worker thread: creates the snapshots, reports them, waits to be told how to end,
-/// then cleans up. Owns every COM object for the life of the set.
+/// The worker thread: creates the snapshots, reports them, answers what it's asked until
+/// it's told how to end, then cleans up. Owns every COM object for the life of the set.
 fn run(
     targets: &[Target],
     options: &SnapshotOptions,
     created: &Sender<Result<Created>>,
-    end: &Receiver<Ending>,
+    requests: &Receiver<Request>,
 ) -> Result<Option<BackupDocument>> {
     let session = match Session::start(targets, options) {
         Ok((session, info)) => {
@@ -289,9 +322,16 @@ fn run(
             return Ok(None);
         }
     };
-    // A closed channel means the set was dropped, which also closes it.
-    let succeeded = matches!(end.recv(), Ok(Ending::Complete));
-    session.finish(succeeded)
+    loop {
+        match requests.recv() {
+            Ok(Request::Lost(reply)) => {
+                let _ = reply.send(session.lost());
+            }
+            Ok(Request::End(Ending::Complete)) => return session.finish(true),
+            // A closed channel means the set was dropped, which also closes it.
+            Ok(Request::End(Ending::Close)) | Err(_) => return session.finish(false),
+        }
+    }
 }
 
 /// One snapshot set's VSS session. Fields drop in order, so the backup components object is
@@ -299,6 +339,8 @@ fn run(
 struct Session {
     backup: Backup,
     set: GUID,
+    /// Each snapshot in the set.
+    snapshots: Vec<GUID>,
     consistency: Consistency,
     selected: Vec<Selected>,
     _apartment: Apartment,
@@ -323,7 +365,7 @@ impl Session {
 
         let set = backup.start_snapshot_set()?;
         match take_snapshots(&backup, targets, with_writers, &selected) {
-            Ok((volumes, writers)) => {
+            Ok((snapshots, volumes, writers)) => {
                 let created = Created {
                     id: to_guid(set),
                     volumes,
@@ -332,6 +374,7 @@ impl Session {
                 let session = Session {
                     backup,
                     set,
+                    snapshots,
                     consistency: options.consistency(),
                     selected,
                     _apartment: apartment,
@@ -378,6 +421,17 @@ impl Session {
         document
     }
 
+    /// The snapshots that are no longer there, by their ids.
+    fn lost(&self) -> Result<Vec<Guid>> {
+        let mut lost = Vec::new();
+        for snapshot in &self.snapshots {
+            if !self.backup.snapshot_exists(*snapshot)? {
+                lost.push(to_guid(*snapshot));
+            }
+        }
+        Ok(lost)
+    }
+
     fn check_selected_writers(&self) -> Result<Vec<WriterStatus>> {
         let statuses = self.backup.writer_statuses()?;
         check_writers(&statuses, &selected_writers(&self.selected))
@@ -421,7 +475,7 @@ fn take_snapshots(
     targets: &[Target],
     with_writers: bool,
     selected: &[Selected],
-) -> Result<(Vec<VolumeSnapshot>, Vec<WriterStatus>)> {
+) -> Result<(Vec<GUID>, Vec<VolumeSnapshot>, Vec<WriterStatus>)> {
     let mut ids = Vec::with_capacity(targets.len());
     for target in targets {
         ids.push(backup.add_to_snapshot_set(&target.guid_path, &target.given)?);
@@ -441,10 +495,10 @@ fn take_snapshots(
     check_writers(&writers, &selected_writers(selected))?;
 
     let mut volumes = Vec::with_capacity(targets.len());
-    for (target, id) in targets.iter().zip(ids) {
-        let properties = backup.snapshot_properties(id)?;
+    for (target, id) in targets.iter().zip(&ids) {
+        let properties = backup.snapshot_properties(*id)?;
         volumes.push(VolumeSnapshot::new(
-            to_guid(id),
+            to_guid(*id),
             target.name.clone(),
             target.guid_path.clone(),
             target.mount_points.clone(),
@@ -452,7 +506,7 @@ fn take_snapshots(
             system_time_from_filetime(properties.created),
         ));
     }
-    Ok((volumes, writers))
+    Ok((ids, volumes, writers))
 }
 
 #[cfg(test)]

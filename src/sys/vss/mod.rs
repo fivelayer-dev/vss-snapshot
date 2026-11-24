@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use windows::core::{s, w, Error as WinError, Result as WinResult, BOOL, BSTR, GUID, HRESULT};
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Storage::Vss::{
-    IVssAsync, VSS_BT_COPY, VSS_CTX_BACKUP, VSS_CTX_FILE_SHARE_BACKUP, VSS_OBJECT_SNAPSHOT_SET,
-    VSS_RS_ALL, VSS_RS_FAILED, VSS_SNAPSHOT_PROP, VSS_S_ASYNC_CANCELLED, VSS_S_ASYNC_FINISHED,
+    IVssAsync, VSS_BT_COPY, VSS_CTX_BACKUP, VSS_CTX_FILE_SHARE_BACKUP, VSS_E_OBJECT_NOT_FOUND,
+    VSS_OBJECT_SNAPSHOT_SET, VSS_RS_ALL, VSS_RS_FAILED, VSS_SNAPSHOT_PROP, VSS_S_ASYNC_CANCELLED,
+    VSS_S_ASYNC_FINISHED,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -263,6 +264,16 @@ impl Backup {
         Ok(SnapshotProperties { device, created })
     }
 
+    /// Whether a snapshot is still there. Windows removes one by itself when the space for
+    /// its volume's shadow copies runs out, and VSS then no longer knows its id.
+    pub(crate) fn snapshot_exists(&self, snapshot: GUID) -> Result<bool> {
+        match self.snapshot_properties(snapshot) {
+            Ok(_) => Ok(true),
+            Err(Error::Vss { code, .. }) if code.code() == VSS_E_OBJECT_NOT_FOUND.0 => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// What every writer reports now.
     pub(crate) fn writer_statuses(&self) -> Result<Vec<WriterStatus>> {
         // SAFETY: `pending` is a valid out-pointer for the call.
@@ -349,10 +360,12 @@ impl Backup {
         Ok(xml.to_string())
     }
 
+    /// Removes every snapshot in a set. A set with none left, as when Windows has removed
+    /// them itself, has nothing to remove, which isn't a failure.
     pub(crate) fn delete_snapshot_set(&self, set: GUID) -> Result<()> {
         let (mut deleted, mut not_deleted) = (0, GUID::zeroed());
         // SAFETY: both out-pointers outlive the call.
-        unsafe {
+        let removed = unsafe {
             self.raw.DeleteSnapshots(
                 set,
                 VSS_OBJECT_SNAPSHOT_SET,
@@ -360,8 +373,11 @@ impl Backup {
                 &mut deleted,
                 &mut not_deleted,
             )
+        };
+        match removed {
+            Err(error) if error.code() == VSS_E_OBJECT_NOT_FOUND => Ok(()),
+            removed => removed.map_err(failed("DeleteSnapshots")),
         }
-        .map_err(failed("DeleteSnapshots"))
     }
 
     // Restoring.

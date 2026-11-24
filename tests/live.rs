@@ -11,6 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -491,4 +492,77 @@ fn completing_without_components_is_refused_but_still_removes_the_snapshot() {
     check_removed(&crash(), &live.first, |s| {
         assert!(matches!(s.complete(), Err(Error::InvalidOptions { .. })));
     });
+}
+
+/// Removes one snapshot from outside its set, as another program can, and as Windows does
+/// by itself when the space for a volume's shadow copies runs out.
+fn remove_from_outside(snapshot: Guid) {
+    let id = snapshot.to_string();
+    let shadow = format!("/shadow={id}");
+    let vssadmin = Command::new("vssadmin")
+        .args(["delete", "shadows", &shadow, "/quiet"])
+        .output()
+        .unwrap();
+    if vssadmin.status.success() {
+        return;
+    }
+    let script = format!(
+        "Get-CimInstance Win32_ShadowCopy | Where-Object {{ $_.ID -eq '{id}' }} | \
+         Remove-CimInstance -ErrorAction Stop"
+    );
+    let cim = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .unwrap();
+    assert!(
+        cim.status.success(),
+        "vssadmin said {:?}, and PowerShell said {:?}",
+        String::from_utf8_lossy(&vssadmin.stdout),
+        String::from_utf8_lossy(&cim.stderr)
+    );
+}
+
+fn ids(volumes: &[&vss_snapshot::VolumeSnapshot]) -> Vec<Guid> {
+    volumes.iter().map(|volume| volume.id()).collect()
+}
+
+#[test]
+fn a_snapshot_removed_from_outside_is_reported_as_lost() {
+    let Some(live) = live("a_snapshot_removed_from_outside_is_reported_as_lost") else {
+        return;
+    };
+    let volumes = [live.first.as_str(), live.second.as_str()];
+    let snapshots = SnapshotSet::create(volumes, &crash()).unwrap();
+    assert!(snapshots.lost().unwrap().is_empty());
+    let (first, second) = (&snapshots.volumes()[0], &snapshots.volumes()[1]);
+    assert!(first.device_path().exists());
+
+    remove_from_outside(first.id());
+    assert_eq!(ids(&snapshots.lost().unwrap()), [first.id()]);
+    assert!(!first.device_path().exists());
+    // The other is as it was. Closing removes it, and doesn't mind the one that's gone.
+    let still_there = second.device_path().to_path_buf();
+    assert!(still_there.exists());
+    snapshots.close().unwrap();
+    assert!(!still_there.exists());
+}
+
+#[test]
+fn a_set_with_no_snapshot_left_still_closes() {
+    let Some(live) = live("a_set_with_no_snapshot_left_still_closes") else {
+        return;
+    };
+    for options in [crash(), SnapshotOptions::new()] {
+        let snapshots = SnapshotSet::create([live.first.as_str()], &options).unwrap();
+        let only = &snapshots.volumes()[0];
+        remove_from_outside(only.id());
+        assert_eq!(ids(&snapshots.lost().unwrap()), [only.id()]);
+        // Asked again, the answer is the same.
+        assert_eq!(ids(&snapshots.lost().unwrap()), [only.id()]);
+        snapshots.close().unwrap();
+    }
+    // And a new snapshot of the volume can be taken afterwards.
+    let snapshots = SnapshotSet::create([live.first.as_str()], &crash()).unwrap();
+    assert!(snapshots.lost().unwrap().is_empty());
+    snapshots.close().unwrap();
 }
